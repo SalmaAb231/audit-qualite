@@ -1,0 +1,24 @@
+# Secrets et configuration locale
+.env
+
+# Données (peuvent être volumineuses et confidentielles)
+data/
+# Cache local des fichiers téléchargés depuis S3 (déjà couvert par data/ ci-dessus,
+# explicite au cas où DATA_DIR pointerait ailleurs)
+data/cache/
+
+# Résultats générés
+resultats/
+
+# Fichiers Excel isolés à la racine (au cas où)
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environnements / IDE
+.vscode/
+.idea/

@@ -1,0 +1,10 @@
+pandas
+openpyxl
+numpy
+requests
+python-dotenv
+loguru
+boto3
+tqdm
+langdetect
+tabulate
