@@ -2,13 +2,19 @@
 Client HTTP pour l'API OpenRouter, socle commun à tous les agents LLM du
 pipeline (Cohérence, Réalisme, Judge, Reporting).
 
-Centralise l'appel réseau, les retries progressifs, le fallback de modèle et
-la journalisation, afin qu'un agent n'ait qu'à fournir ses prompts et à
-récupérer une réponse déjà robustifiée, sans dupliquer cette logique.
+Centralise l'appel réseau, la cascade de modèles (config.MODELES : liste par
+agent, du principal aux fallbacks, puis config.MODELE_FALLBACK en tout
+dernier recours), les retries progressifs, le cache des réponses et le
+respect des contraintes du tier gratuit OpenRouter (config.RATE_LIMIT),
+afin qu'un agent n'ait qu'à fournir ses prompts et récupérer une réponse
+déjà robustifiée, sans dupliquer cette logique.
 """
 
+import hashlib
+import json
 import time
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 import requests
@@ -16,10 +22,6 @@ from loguru import logger
 
 import config
 from agents.parse_utils import extraire_json
-
-# Délais progressifs (en secondes) entre chaque nouvelle tentative sur le
-# modèle principal. 3 délais -> 3 retries -> 4 essais au total avant fallback.
-DELAIS_RETRY = (2, 8, 20)
 
 # Utilisés quand l'appelant ne précise pas explicitement de température/
 # max_tokens (les agents passeront normalement les valeurs de config.py).
@@ -44,11 +46,90 @@ class AppelMetadata:
     nb_retries: int = 0
     modele_fallback_utilise: bool = False
     cout_estime: float | None = None
+    depuis_cache: bool = False
     erreur: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Cache des réponses LLM (config.CACHE_LLM_DIR) : un prompt identique
+# (même system/user/température/max_tokens) est servi depuis le disque sans
+# consommer de requête OpenRouter.
+# ---------------------------------------------------------------------------
+
+
+def _cle_cache(system_prompt: str, user_prompt: str, temperature: float, max_tokens: int, json_attendu: bool) -> str:
+    empreinte = "\x1f".join([system_prompt, user_prompt, str(temperature), str(max_tokens), str(json_attendu)])
+    return hashlib.sha256(empreinte.encode("utf-8")).hexdigest()
+
+
+def _lire_cache(cle: str) -> dict | None:
+    chemin = config.CACHE_LLM_DIR / f"{cle}.json"
+    if not chemin.exists():
+        return None
+    try:
+        return json.loads(chemin.read_text(encoding="utf-8"))
+    except ValueError:
+        logger.warning(f"Entrée de cache LLM corrompue ignorée : {chemin.name}")
+        return None
+
+
+def _ecrire_cache(cle: str, modele: str, texte: str, tokens_entree: int | None, tokens_sortie: int | None, cout_estime: float | None) -> None:
+    config.CACHE_LLM_DIR.mkdir(parents=True, exist_ok=True)
+    chemin = config.CACHE_LLM_DIR / f"{cle}.json"
+    chemin.write_text(
+        json.dumps(
+            {
+                "modele": modele,
+                "texte": texte,
+                "tokens_entree": tokens_entree,
+                "tokens_sortie": tokens_sortie,
+                "cout_estime": cout_estime,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Compteur quotidien de requêtes réelles (config.COMPTEUR_REQUETES_FICHIER),
+# pour ne jamais dépasser config.RATE_LIMIT["max_requetes_jour"].
+# ---------------------------------------------------------------------------
+
+
+def _lire_compteur_quotidien() -> int:
+    """Retourne le nombre de requêtes déjà effectuées aujourd'hui (0 si nouveau jour ou fichier absent/corrompu)."""
+    try:
+        donnees = json.loads(config.COMPTEUR_REQUETES_FICHIER.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return 0
+    if donnees.get("date") != date.today().isoformat():
+        return 0
+    return donnees.get("compteur", 0)
+
+
+def _incrementer_compteur_quotidien() -> int:
+    """Incrémente et persiste le compteur quotidien de requêtes réelles. Retourne le nouveau total."""
+    compteur = _lire_compteur_quotidien() + 1
+    config.CACHE_LLM_DIR.mkdir(parents=True, exist_ok=True)
+    config.COMPTEUR_REQUETES_FICHIER.write_text(
+        json.dumps({"date": date.today().isoformat(), "compteur": compteur}),
+        encoding="utf-8",
+    )
+    return compteur
+
+
 class LLMClient:
-    """Client d'appel à l'API OpenRouter, avec retries progressifs et fallback de modèle."""
+    """
+    Client d'appel à l'API OpenRouter, avec cascade de modèles, retries
+    progressifs, cache de réponses et respect des limites du tier gratuit.
+    """
+
+    # Horodatage (time.monotonic) du dernier appel réseau réel, partagé par
+    # toutes les instances du processus, pour respecter RATE_LIMIT["pause_entre_appels"]
+    # même si plusieurs LLMClient() sont créés (un par agent, par exemple).
+    _dernier_appel_ts: float | None = None
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None):
         self.api_key = api_key or config.OPENROUTER_API_KEY
@@ -60,88 +141,130 @@ class LLMClient:
         self,
         system_prompt: str,
         user_prompt: str,
-        model: str | None = None,
+        model: str | list[str] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_attendu: bool = True,
     ) -> tuple[Any, AppelMetadata]:
         """
-        Envoie un prompt système + utilisateur à un modèle OpenRouter.
+        Envoie un prompt système + utilisateur à une cascade de modèles OpenRouter.
 
-        Essaie `model` (ou config.MODELE_FALLBACK si non précisé) avec jusqu'à
-        len(DELAIS_RETRY) retries progressifs sur erreur réseau, HTTP 429/5xx,
-        ou JSON invalide (si json_attendu). Une erreur HTTP non transitoire
-        (4xx hors 429) interrompt immédiatement les essais sur ce modèle.
-        Si le modèle principal échoue complètement, retente une dernière fois
-        avec config.MODELE_FALLBACK.
+        `model` peut être un identifiant unique, ou (cas normal avec
+        config.MODELES) une liste ordonnée : le premier modèle est essayé
+        avec jusqu'à config.RATE_LIMIT["retries_max"] retries progressifs
+        (délais doublés depuis config.RATE_LIMIT["backoff_initial"]) sur
+        erreur réseau, HTTP 429/5xx ou JSON invalide (si json_attendu). Une
+        erreur HTTP non transitoire (4xx hors 429) passe immédiatement au
+        modèle suivant. Si toute la liste échoue, un dernier essai est fait
+        avec config.MODELE_FALLBACK (l'auto-routeur du tier gratuit).
+
+        Si un appel strictement identique (mêmes prompts/température/
+        max_tokens) a déjà réussi, la réponse est servie depuis
+        config.CACHE_LLM_DIR sans consommer de requête. Sinon, chaque
+        tentative réseau réelle est comptée dans config.COMPTEUR_REQUETES_FICHIER
+        et bloquée proprement si config.RATE_LIMIT["max_requetes_jour"] est atteint.
 
         Retourne (reponse_parsee, metadata). Si json_attendu, reponse_parsee
         est le JSON extrait (dict/list) en cas de succès, ou la meilleure
         réponse partielle récupérée sinon (peut être None). Si json_attendu
         est faux, reponse_parsee est le texte brut de la réponse.
         """
-        modele_principal = model or config.MODELE_FALLBACK
         temperature = TEMPERATURE_PAR_DEFAUT if temperature is None else temperature
         max_tokens = MAX_TOKENS_PAR_DEFAUT if max_tokens is None else max_tokens
 
+        cle_cache = _cle_cache(system_prompt, user_prompt, temperature, max_tokens, json_attendu)
+        entree_cache = _lire_cache(cle_cache)
+        if entree_cache is not None:
+            logger.info(f"Réponse servie depuis le cache LLM (modèle d'origine={entree_cache['modele']}), aucune requête consommée.")
+            reponse = extraire_json(entree_cache["texte"]) if json_attendu else entree_cache["texte"]
+            metadata = AppelMetadata(
+                modele=entree_cache["modele"],
+                succes=True,
+                tokens_entree=entree_cache.get("tokens_entree"),
+                tokens_sortie=entree_cache.get("tokens_sortie"),
+                cout_estime=entree_cache.get("cout_estime"),
+                depuis_cache=True,
+            )
+            return reponse, metadata
+
+        if isinstance(model, str):
+            modeles_a_essayer = [model]
+        elif model:
+            modeles_a_essayer = list(model)
+        else:
+            modeles_a_essayer = [config.MODELE_FALLBACK]
+
+        retries_max = config.RATE_LIMIT["retries_max"]
+        backoff_initial = config.RATE_LIMIT["backoff_initial"]
+        delais = [backoff_initial * (2**i) for i in range(retries_max)]
+
         debut = time.monotonic()
         meilleur = {"texte": "", "parsed": None, "tokens_entree": None, "tokens_sortie": None, "cout_estime": None}
-        nb_retries = 0
+        nb_retries_total = 0
         derniere_erreur = None
+        quota_atteint = False
 
-        # --- Essais sur le modèle principal ---
-        for tentative in range(len(DELAIS_RETRY) + 1):
-            if tentative > 0:
-                delai = DELAIS_RETRY[tentative - 1]
-                logger.warning(
-                    f"Nouvel essai ({tentative}/{len(DELAIS_RETRY)}) pour {modele_principal} "
-                    f"dans {delai}s (raison précédente : {derniere_erreur})."
-                )
-                time.sleep(delai)
-                nb_retries += 1
+        for modele in modeles_a_essayer:
+            for tentative in range(retries_max + 1):
+                if tentative > 0:
+                    delai = delais[tentative - 1]
+                    logger.warning(
+                        f"Nouvel essai ({tentative}/{retries_max}) pour {modele} "
+                        f"dans {delai}s (raison précédente : {derniere_erreur})."
+                    )
+                    time.sleep(delai)
+                    nb_retries_total += 1
 
-            resultat = self._tenter(modele_principal, system_prompt, user_prompt, temperature, max_tokens, json_attendu)
-            self._mettre_a_jour_meilleur(meilleur, resultat)
+                resultat = self._tenter(modele, system_prompt, user_prompt, temperature, max_tokens, json_attendu)
+                self._mettre_a_jour_meilleur(meilleur, resultat)
 
-            if resultat["succes"]:
-                return self._finaliser_succes(resultat, modele_principal, debut, nb_retries, False)
+                if resultat["succes"]:
+                    _ecrire_cache(cle_cache, modele, resultat["texte"], resultat["tokens_entree"], resultat["tokens_sortie"], resultat["cout_estime"])
+                    return self._finaliser_succes(resultat, modele, debut, nb_retries_total, modele != modeles_a_essayer[0])
 
-            derniere_erreur = resultat["erreur"]
-            if not resultat["retryable"]:
-                logger.warning(f"Erreur non retentable sur {modele_principal} ({derniere_erreur}), arrêt des essais sur ce modèle.")
+                derniere_erreur = resultat["erreur"]
+                if resultat.get("quota_atteint"):
+                    quota_atteint = True
+                    break
+                if not resultat["retryable"]:
+                    logger.warning(f"Erreur non retentable sur {modele} ({derniere_erreur}), passage au modèle suivant.")
+                    break
+
+            if quota_atteint:
                 break
 
-        # --- Repli sur le modèle de secours (un seul essai) ---
+        # --- Repli sur l'auto-routeur (un seul essai), sauf si déjà essayé ou quota atteint ---
         modele_fallback_utilise = False
-        if modele_principal != config.MODELE_FALLBACK:
+        if not quota_atteint and config.MODELE_FALLBACK not in modeles_a_essayer:
             logger.warning(
-                f"Modèle {modele_principal} en échec après {nb_retries} retries "
-                f"(erreur : {derniere_erreur}), repli sur {config.MODELE_FALLBACK}."
+                f"Tous les modèles principaux ont échoué après {nb_retries_total} retries "
+                f"(dernière erreur : {derniere_erreur}), repli sur {config.MODELE_FALLBACK}."
             )
-            nb_retries += 1
+            nb_retries_total += 1
             modele_fallback_utilise = True
             resultat = self._tenter(config.MODELE_FALLBACK, system_prompt, user_prompt, temperature, max_tokens, json_attendu)
             self._mettre_a_jour_meilleur(meilleur, resultat)
 
             if resultat["succes"]:
-                return self._finaliser_succes(resultat, config.MODELE_FALLBACK, debut, nb_retries, True)
+                _ecrire_cache(cle_cache, config.MODELE_FALLBACK, resultat["texte"], resultat["tokens_entree"], resultat["tokens_sortie"], resultat["cout_estime"])
+                return self._finaliser_succes(resultat, config.MODELE_FALLBACK, debut, nb_retries_total, True)
 
             derniere_erreur = resultat["erreur"]
 
         # --- Échec complet : on retourne la meilleure réponse partielle obtenue ---
         duree = time.monotonic() - debut
         logger.error(
-            f"Échec complet de l'appel LLM après {nb_retries} retries "
-            f"(modèle principal={modele_principal}, dernière erreur : {derniere_erreur})."
+            f"Échec complet de l'appel LLM après {nb_retries_total} retries sur "
+            f"{len(modeles_a_essayer)} modèle(s) (dernière erreur : {derniere_erreur})."
         )
         reponse = meilleur["parsed"] if json_attendu else meilleur["texte"]
         metadata = AppelMetadata(
-            modele=modele_principal,
+            modele=modeles_a_essayer[0],
             succes=False,
             tokens_entree=meilleur["tokens_entree"],
             tokens_sortie=meilleur["tokens_sortie"],
             duree_secondes=duree,
-            nb_retries=nb_retries,
+            nb_retries=nb_retries_total,
             modele_fallback_utilise=modele_fallback_utilise,
             cout_estime=meilleur["cout_estime"],
             erreur=derniere_erreur,
@@ -178,6 +301,16 @@ class LLMClient:
         )
         return resultat["parsed"], metadata
 
+    @classmethod
+    def _respecter_pause_entre_appels(cls) -> None:
+        """Impose un écart minimal entre deux appels réseau réels (RATE_LIMIT['pause_entre_appels'])."""
+        if cls._dernier_appel_ts is not None:
+            ecoule = time.monotonic() - cls._dernier_appel_ts
+            attente = config.RATE_LIMIT["pause_entre_appels"] - ecoule
+            if attente > 0:
+                time.sleep(attente)
+        cls._dernier_appel_ts = time.monotonic()
+
     def _tenter(
         self,
         modele: str,
@@ -190,14 +323,27 @@ class LLMClient:
         """
         Effectue une tentative unique d'appel HTTP à OpenRouter. Ne lève jamais
         d'exception : toute erreur est capturée et rapportée dans le dict
-        retourné (clés 'erreur' et 'retryable') pour laisser l'appelant décider
-        de retenter ou non.
+        retourné (clés 'erreur', 'retryable', 'quota_atteint') pour laisser
+        l'appelant décider de retenter ou non.
         """
         resultat = {
-            "succes": False, "retryable": True, "texte": "", "parsed": None,
+            "succes": False, "retryable": True, "quota_atteint": False,
+            "texte": "", "parsed": None,
             "tokens_entree": None, "tokens_sortie": None, "cout_estime": None,
             "erreur": None,
         }
+
+        compteur_actuel = _lire_compteur_quotidien()
+        max_requetes_jour = config.RATE_LIMIT["max_requetes_jour"]
+        if compteur_actuel >= max_requetes_jour:
+            resultat["erreur"] = f"limite quotidienne de requêtes OpenRouter atteinte ({compteur_actuel}/{max_requetes_jour})"
+            resultat["retryable"] = False
+            resultat["quota_atteint"] = True
+            logger.error(f"Appel bloqué : {resultat['erreur']}.")
+            return resultat
+
+        self._respecter_pause_entre_appels()
+        _incrementer_compteur_quotidien()
 
         try:
             reponse_http = requests.post(
