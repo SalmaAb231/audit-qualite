@@ -10,7 +10,8 @@ data/cache/
 # Résultats générés
 resultats/
 
-# Cache des réponses LLM et compteur de quota (état d'exécution local)
+# Cache des réponses LLM (agents/llm_client.py) et compteur de quota :
+# état d'exécution local, rejouable, pas à versionner
 cache_llm/
 
 # Logs d'exécution

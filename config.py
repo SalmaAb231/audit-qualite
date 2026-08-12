@@ -76,7 +76,6 @@ MODELES = {
     # → le meilleur modèle gratuit disponible (contexte 1M, support tools)
     "coherence": [
         "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "openai/gpt-oss-120b:free",
         "google/gemma-4-31b-it:free",
     ],
 
@@ -124,7 +123,10 @@ TEMPERATURES = {
 # → erreur de parsing. Les tokens sont gratuits sur les :free, être généreux
 # ne coûte que de la latence.
 MAX_TOKENS = {
-    "coherence": 8192,   # raisonnement + JSON d'anomalies potentiellement long
+    # Doublé le 2026-08-12 : troncature observée à 8192 sur un chunk dense
+    # en anomalies (fichier à 51 colonnes), qui a fait perdre une anomalie
+    # (champs coupés en plein milieu, rejetée par valider_anomalies).
+    "coherence": 16384,  # raisonnement + JSON d'anomalies potentiellement long
     "realisme": 4096,    # raisonnement + résultats de recherche web
     "judge": 1024,       # justification courte
     "reporting": 4096,   # rapports consolidés = textes longs
@@ -158,21 +160,29 @@ COMPTEUR_REQUETES_FICHIER = CACHE_LLM_DIR / "compteur_quotidien.json"
 # ---------------------------------------------------------------------------
 # Découpage des données envoyées aux agents LLM
 # ---------------------------------------------------------------------------
-# Lignes de données par appel LLM (unique constante de chunking, commune aux
-# agents Cohérence et Réalisme). 500 = compromis retenu : ~15-18K tokens par
-# chunk (compatible avec le plus petit contexte des cascades, 131K), risque
-# limité de troncature de la réponse JSON et de dilution d'attention, tout en
-# restant viable en quota gratuit (~3 400 appels pour le run Cohérence complet).
+# Nombre de lignes de données envoyées par appel LLM (chunk). Constante COMMUNE
+# aux agents Cohérence et Réalisme. 500 lignes ≈ 15K tokens ≈ 11% du plus petit
+# contexte des cascades (131K) : compromis quota (45 req/jour) / fiabilité de
+# lecture, choisi sans test d'attention. Le rappel mesuré par injection en
+# phase d'évaluation validera (ou fera ajuster) cette valeur.
 CHUNK_SIZE = 500
 
-# Nombre maximal de lignes envoyées au LLM par fichier (0 = fichier complet).
-# Sert à échantillonner les gros fichiers pendant le DÉVELOPPEMENT pour
-# limiter la consommation de requêtes. À mettre à 0 pour les runs réels.
+# Au-delà de ce nombre de lignes, un fichier est "géant" : il est échantillonné
+# au lieu d'être lu en entier (5-6 fichiers sur 202 sont concernés). Tous les
+# autres fichiers sont TOUJOURS analysés intégralement.
+SEUIL_FICHIER_GEANT = 20000
+
+# Taille de l'échantillon (tirage seed=42, index d'origine conservés) appliqué
+# aux SEULS fichiers géants — y compris lors des runs réels. Ne jamais mettre 0
+# pour un run complet : les géants coûteraient ~2 600 chunks à eux seuls.
+# Augmenter = meilleure couverture des géants contre plus d'appels (arbitrage
+# après le run pilote).
 MAX_LIGNES_PAR_FICHIER = 2000
 
-# Taux d'échantillonnage aléatoire des lignes "normales" envoyées en contrôle
-# aux agents LLM en plus des lignes suspectes (utilisé par l'orchestrateur
-# si le scan complet n'est pas activé). Entre 0.0 et 1.0.
+# Composition de l'échantillon des fichiers géants : part de lignes tirées au
+# hasard, le complément étant les lignes priorisées par le canal statistique.
+# (Seul usage restant de cette constante depuis le passage aux canaux
+# parallèles ; la supprimer si cette composition n'est pas implémentée.)
 TAUX_ECHANTILLON_CONTROLE = 0.10
 
 # ---------------------------------------------------------------------------
