@@ -10,6 +10,9 @@ data/cache/
 # Résultats générés
 resultats/
 
+# Cache des réponses LLM (agents/llm_client.py) : rejouable, pas à versionner
+cache_llm/
+
 # Fichiers Excel isolés à la racine (au cas où)
 *.xlsx
 

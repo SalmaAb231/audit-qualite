@@ -1,0 +1,61 @@
+[
+  {
+    "ligne": 10,
+    "colonnes": [
+      "Engine"
+    ],
+    "axe": "axe1_motorisation_vs_carburant",
+    "description": "Fuel='ELECTRIC' mais Engine='TDI 2.0' (code moteur diesel) : motorisations mutuellement exclusives.",
+    "valeurs_avant": {
+      "Engine": "PMSM"
+    },
+    "valeurs_injectees": {
+      "Engine": "TDI 2.0"
+    }
+  },
+  {
+    "ligne": 60,
+    "colonnes": [
+      "Power"
+    ],
+    "axe": "axe3_puissance_vs_modele",
+    "description": "Puissance de 1500 kW (2039 pk) manifestement incompatible avec une smart #1/#3 (citadine électrique).",
+    "valeurs_avant": {
+      "Power": "200 kW (272 pk)"
+    },
+    "valeurs_injectees": {
+      "Power": "1500 kW (2039 pk)"
+    }
+  },
+  {
+    "ligne": 110,
+    "colonnes": [
+      "Duration",
+      "Mileage"
+    ],
+    "axe": "axe5_duree_vs_kilometrage",
+    "description": "Contrat de 60 mois avec seulement 1 km/an autorisé : incohérence durée/kilométrage.",
+    "valeurs_avant": {
+      "Duration": "36",
+      "Mileage": "20000"
+    },
+    "valeurs_injectees": {
+      "Duration": "60",
+      "Mileage": "1"
+    }
+  },
+  {
+    "ligne": 160,
+    "colonnes": [
+      "Fuel"
+    ],
+    "axe": "axe6_valeur_mauvaise_colonne",
+    "description": "La colonne Fuel contient '36' (une durée en mois), pas un type de carburant.",
+    "valeurs_avant": {
+      "Fuel": "ELECTRIC"
+    },
+    "valeurs_injectees": {
+      "Fuel": "36"
+    }
+  }
+]
