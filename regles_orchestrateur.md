@@ -1,9 +1,10 @@
 # Règles de l'orchestrateur
 
 Ce document décrit `orchestrateur.py`, le chef de gare du pipeline :
-`structure/` (portier) → `stats/` (tout le fichier) → `Réalisme` (lignes
-suspectes seulement) → `judge/` (verdict) → `reporting/` (rapport), puis un
-rapport consolidé sur le run entier.
+`structure/` (portier) → `stats/` **et** Cohérence **en parallèle** (chacun
+sur tout le fichier) → `Réalisme` (lignes suspectes pointées par les trois
+détecteurs précédents + échantillon de contrôle) → `judge/` (verdict) →
+`reporting/` (rapport), puis un rapport consolidé sur le run entier.
 
 ## Écart avec une première version proposée
 
@@ -61,14 +62,72 @@ manquer un vrai problème.
   `stats/regles.md`) : les outliers suivants de la même colonne ne
   deviennent pas des lignes suspectes via ce mécanisme, seulement via
   l'échantillon aléatoire (probabilité, pas garantie).
-- Cohérence n'existe pas encore dans le dépôt : elle ne contribue pas
-  (encore) à la sélection. Prévu pour être ajoutée dans `pipeline_fichier()`
-  dès que `agents/agent_coherence.py` existe.
-
 Effet de bord positif observé : en pratique, `len(lot_suspect)` reste très
 inférieur à `config.MAX_LIGNES_PAR_FICHIER` (2000) même sur les plus gros
 fichiers du projet — cette limite de `agents/agent_realisme.py` reste un
 filet de sécurité, plus le mécanisme réellement actif de réduction de coût.
+
+## Cohérence en parallèle avec Stats
+
+`pipeline_fichier()` lance `stats.agent_stats.analyser()` et
+`AgentCoherence().analyser_fichier()` **dans deux threads** (`ThreadPoolExecutor`,
+2 workers) juste après le garde de structure, et attend les deux avant de
+continuer — deux canaux indépendants qui lisent chacun tout le fichier, sans
+que l'un filtre l'autre (Cohérence ne reçoit jamais que les lignes suspectes
+de Stats, ni l'inverse). Leurs anomalies combinées alimentent à la fois
+`_lignes_suspectes()` (pour Réalisme) et `toutes_anomalies` (pour le
+verdict final).
+
+**Pourquoi des threads et pas juste un appel séquentiel** : Stats est
+quasi-instantané (pandas, pas de LLM) alors que Cohérence peut prendre
+plusieurs minutes (plusieurs appels LLM en chunks) — les lancer en parallèle
+évite d'attendre Stats-puis-Cohérence en série pour rien, sans risque de
+concurrence entre eux (Stats ne touche jamais le compteur de quota LLM ni le
+cache réseau, seul Cohérence le fait).
+
+**Deux redondances acceptées, plutôt que de modifier le code de Cohérence** :
+- `AgentCoherence.analyser_fichier(chemin)` recharge elle-même le fichier
+  depuis le disque (`ingestion.local_loader.LocalLoader`), au lieu de
+  réutiliser le `df` déjà chargé par l'orchestrateur — double lecture du
+  même fichier, notable sur les plus gros fichiers du projet (plusieurs
+  centaines de milliers de lignes).
+- Elle exécute aussi son propre garde d'entrée `structure/` en interne
+  (`_verifier_exploitabilite`), redondant avec celui déjà fait par
+  `pipeline_fichier()` juste avant. Sans incidence sur le résultat
+  (`structure/` est déterministe et rapide), juste un calcul en double.
+
+Les deux sont volontairement non corrigées ici : refactorer
+`agents/agent_coherence.py` pour accepter un `df` déjà chargé est un
+changement du code d'un autre binôme, à faire avec elle plutôt qu'en
+solo dans l'orchestrateur.
+
+**Coût en requêtes, à surveiller** : contrairement à Réalisme (limité aux
+lignes suspectes), Cohérence traite tout le fichier en chunks
+(`config.CHUNK_SIZE`) — un fichier de plusieurs milliers de lignes peut
+coûter plusieurs dizaines de requêtes à lui seul (voir le commentaire de
+`config.CHUNK_SIZE` : "~3 400 appels pour le run Cohérence complet" sur
+l'ensemble du projet). Avec `config.RATE_LIMIT["max_requetes_jour"] = 45`,
+un run multi-fichiers via `orchestrateur.main()` peut désormais épuiser le
+quota sur un seul gros fichier — le garde-fou de quota (section suivante)
+protège contre les conséquences (verdicts faussement propres), mais ne
+change pas le fait qu'on traite beaucoup moins de fichiers par jour
+qu'avant l'ajout de Cohérence.
+
+**Limite connue restante** :
+- `stats.verifier_outliers_numeriques` n'inclut dans son anomalie que
+  l'index du **premier** outlier de chaque colonne (voir son docstring et
+  `stats/regles.md`) : les outliers suivants de la même colonne ne
+  deviennent pas des lignes suspectes via ce mécanisme, seulement via
+  l'échantillon aléatoire (probabilité, pas garantie).
+
+## Pas de recherche web pour Réalisme
+
+Réalisme juge la plausibilité des valeurs avec les seules connaissances
+internes du modèle — aucun appel à un moteur de recherche. Nécessiterait un
+service de recherche externe (clé API à choisir et obtenir) et une
+implémentation d'appel d'outils dans `agents/llm_client.py` (socle partagé
+avec Cohérence) : décision volontairement mise en attente, voir
+`agents/regles_realisme.md` ("Limite connue : pas de recherche web").
 
 ## Garde-fou de quota
 

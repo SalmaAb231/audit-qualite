@@ -132,6 +132,15 @@ MAX_TOKENS = {
     "reporting": 4096,   # rapports consolidés = textes longs
 }
 
+# Vérification des anomalies Réalisme par recherche web (agents/agent_realisme.py,
+# bibliothèque `ddgs` : DuckDuckGo, gratuite, sans clé API) avant de les
+# retenir définitivement — réduit les faux positifs dus à des connaissances
+# figées à l'entraînement du modèle (ex. un modèle de véhicule récent jugé
+# "inexistant"). Un seul appel LLM de vérification par chunk (pas par
+# anomalie). À couper (False) si ddgs devient indisponible/peu fiable, sans
+# toucher au code — voir agents/regles_realisme.md.
+RECHERCHE_WEB_ACTIVEE = True
+
 # ---------------------------------------------------------------------------
 # Contraintes du tier gratuit OpenRouter (modèles :free)
 # ---------------------------------------------------------------------------

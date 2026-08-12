@@ -4,18 +4,34 @@ Tests unitaires du module agents/agent_realisme.py.
 Aucun test n'effectue d'appel réseau réel : un client LLM factice
 (_ClientFactice) simule LLMClient.appeler() pour ne jamais consommer le
 quota gratuit partagé du projet (config.RATE_LIMIT["max_requetes_jour"]).
+config.RECHERCHE_WEB_ACTIVEE est désactivée par défaut (fixture autouse) pour
+qu'aucun test n'appelle réellement DuckDuckGo ni ne consomme un deuxième
+appel LLM de vérification par accident ; les tests dédiés à cette fonction
+la réactivent explicitement et simulent `DDGS`.
 
 Usage :
     python -m pytest tests/test_agent_realisme.py -v
 """
 
 import pandas as pd
+import pytest
 
 import config
-from agents.agent_realisme import _decouper_en_chunks, analyser
+from agents.agent_realisme import (
+    _construire_requete_recherche,
+    _decouper_en_chunks,
+    _rechercher_web,
+    _verifier_avec_recherche_web,
+    analyser,
+)
 from agents.llm_client import AppelMetadata
 
 NOM_FICHIER_TEST = "test.xlsx"
+
+
+@pytest.fixture(autouse=True)
+def _desactiver_recherche_web_par_defaut(monkeypatch):
+    monkeypatch.setattr(config, "RECHERCHE_WEB_ACTIVEE", False)
 
 CHAMPS_CONTRAT = {
     "fichier", "ligne", "colonnes", "type", "severite",
@@ -150,10 +166,27 @@ def test_analyser_multi_chunks_agrege(monkeypatch):
     assert {a["ligne"] for a in anomalies} == {0, 2}
 
 
-def test_analyser_respecte_max_lignes_par_fichier(monkeypatch):
-    # Sans troncature, 10 lignes avec CHUNK_SIZE=4 -> 3 chunks. Avec
-    # MAX_LIGNES_PAR_FICHIER=4, un seul chunk est envoyé : la troncature a
-    # bien eu lieu avant le découpage.
+def test_analyser_sous_le_seuil_geant_ne_tronque_pas(monkeypatch):
+    # Règle alignée sur agents/agent_coherence.py : sous SEUIL_FICHIER_GEANT,
+    # AUCUNE troncature, même si le fichier dépasse MAX_LIGNES_PAR_FICHIER.
+    # 10 lignes, CHUNK_SIZE=4 -> 3 chunks, aucune ligne perdue.
+    monkeypatch.setattr(config, "MAX_LIGNES_PAR_FICHIER", 4)
+    monkeypatch.setattr(config, "CHUNK_SIZE", 4)
+    client = _ClientFactice(reponses=[
+        ({"anomalies": []}, AppelMetadata(modele="m", succes=True)),
+        ({"anomalies": []}, AppelMetadata(modele="m", succes=True)),
+        ({"anomalies": []}, AppelMetadata(modele="m", succes=True)),
+    ])
+
+    analyser(NOM_FICHIER_TEST, _df_simple(10), client=client)
+
+    assert len(client.appels) == 3
+
+
+def test_analyser_echantillonne_les_fichiers_geants(monkeypatch):
+    # Au-dessus de SEUIL_FICHIER_GEANT, échantillonné à MAX_LIGNES_PAR_FICHIER
+    # lignes avant le découpage en chunks : 10 lignes -> 4 -> 1 seul chunk.
+    monkeypatch.setattr(config, "SEUIL_FICHIER_GEANT", 4)
     monkeypatch.setattr(config, "MAX_LIGNES_PAR_FICHIER", 4)
     monkeypatch.setattr(config, "CHUNK_SIZE", 4)
     client = _ClientFactice(reponses=[({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
@@ -161,6 +194,22 @@ def test_analyser_respecte_max_lignes_par_fichier(monkeypatch):
     analyser(NOM_FICHIER_TEST, _df_simple(10), client=client)
 
     assert len(client.appels) == 1
+
+
+def test_analyser_echantillon_fichier_geant_reproductible(monkeypatch):
+    # Même seed que l'échantillonnage réel (SEED_ECHANTILLONNAGE) : deux
+    # analyses du même fichier géant doivent envoyer les mêmes lignes.
+    monkeypatch.setattr(config, "SEUIL_FICHIER_GEANT", 4)
+    monkeypatch.setattr(config, "MAX_LIGNES_PAR_FICHIER", 4)
+    monkeypatch.setattr(config, "CHUNK_SIZE", 100)
+
+    prompts = []
+    for _ in range(2):
+        client = _ClientFactice(reponses=[({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
+        analyser(NOM_FICHIER_TEST, _df_simple(20), client=client)
+        prompts.append(client.appels[0]["user_prompt"])
+
+    assert prompts[0] == prompts[1]
 
 
 def test_analyser_appelle_avec_les_bons_parametres_config():
@@ -201,3 +250,116 @@ def test_toutes_les_anomalies_respectent_le_contrat():
         assert anomalie["severite"] in {"critical", "high", "medium", "low"}
         assert isinstance(anomalie["confiance"], float)
         assert 0.0 <= anomalie["confiance"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Vérification web (_construire_requete_recherche, _rechercher_web,
+# _verifier_avec_recherche_web)
+# ---------------------------------------------------------------------------
+
+
+class _DDGSFactice:
+    """Simule ddgs.DDGS() : retourne des résultats fixes ou lève, sans réseau."""
+
+    def __init__(self, resultats=None, leve=False):
+        self.resultats = resultats if resultats is not None else [{"title": "T", "body": "B"}]
+        self.leve = leve
+        self.requetes = []
+
+    def text(self, requete, max_results=3):
+        self.requetes.append(requete)
+        if self.leve:
+            raise RuntimeError("panne réseau ddgs simulée")
+        return self.resultats
+
+
+def test_construire_requete_recherche_combine_valeur_et_colonnes():
+    anomalie = _anomalie_brute(colonnes=["Model", "version"])
+    anomalie["valeur"] = "EX40"
+    assert _construire_requete_recherche(anomalie) == "EX40 Model version"
+
+
+def test_rechercher_web_retourne_vide_sur_echec(monkeypatch):
+    import agents.agent_realisme as agent_realisme_module
+    monkeypatch.setattr(agent_realisme_module, "DDGS", lambda: _DDGSFactice(leve=True))
+    assert _rechercher_web("peu importe") == ""
+
+
+def test_rechercher_web_retourne_vide_si_requete_vide():
+    assert _rechercher_web("   ") == ""
+
+
+def test_rechercher_web_formate_les_resultats(monkeypatch):
+    import agents.agent_realisme as agent_realisme_module
+    monkeypatch.setattr(
+        agent_realisme_module, "DDGS",
+        lambda: _DDGSFactice(resultats=[{"title": "Volvo EX40", "body": "modèle électrique 2026"}]),
+    )
+    resultat = _rechercher_web("Volvo EX40")
+    assert "Volvo EX40" in resultat
+    assert "modèle électrique 2026" in resultat
+
+
+def test_verifier_avec_recherche_web_desactivee_ne_fait_rien(monkeypatch):
+    monkeypatch.setattr(config, "RECHERCHE_WEB_ACTIVEE", False)
+    anomalies = [_anomalie_brute()]
+    client = _ClientExplosif()  # preuve qu'il n'est jamais appelé
+    assert _verifier_avec_recherche_web(NOM_FICHIER_TEST, anomalies, client) == anomalies
+
+
+def test_verifier_avec_recherche_web_sans_resultat_conserve_les_anomalies(monkeypatch):
+    import agents.agent_realisme as agent_realisme_module
+    monkeypatch.setattr(config, "RECHERCHE_WEB_ACTIVEE", True)
+    monkeypatch.setattr(agent_realisme_module, "PAUSE_ENTRE_RECHERCHES_SECONDES", 0.0)
+    monkeypatch.setattr(agent_realisme_module, "DDGS", lambda: _DDGSFactice(resultats=[]))
+
+    anomalies = [_anomalie_brute()]
+    client = _ClientExplosif()  # aucun résultat -> jamais appelé
+
+    assert _verifier_avec_recherche_web(NOM_FICHIER_TEST, anomalies, client) == anomalies
+
+
+def test_verifier_avec_recherche_web_retire_une_anomalie_contredite(monkeypatch):
+    import agents.agent_realisme as agent_realisme_module
+    monkeypatch.setattr(config, "RECHERCHE_WEB_ACTIVEE", True)
+    monkeypatch.setattr(agent_realisme_module, "PAUSE_ENTRE_RECHERCHES_SECONDES", 0.0)
+    monkeypatch.setattr(agent_realisme_module, "DDGS", lambda: _DDGSFactice())
+
+    anomalies = [_anomalie_brute(ligne=0), _anomalie_brute(ligne=1)]
+    reponse_verif = {"verifications": [
+        {"index": 0, "confirmee": False, "raison": "Le web montre que ce modèle existe."},
+        {"index": 1, "confirmee": True, "raison": "Toujours invraisemblable."},
+    ]}
+    client = _ClientFactice(reponses=[(reponse_verif, AppelMetadata(modele="m", succes=True))])
+
+    resultat = _verifier_avec_recherche_web(NOM_FICHIER_TEST, anomalies, client)
+
+    assert len(resultat) == 1
+    assert resultat[0]["ligne"] == 1
+    assert len(client.appels) == 1
+
+
+def test_verifier_avec_recherche_web_echec_llm_conserve_les_anomalies(monkeypatch):
+    import agents.agent_realisme as agent_realisme_module
+    monkeypatch.setattr(config, "RECHERCHE_WEB_ACTIVEE", True)
+    monkeypatch.setattr(agent_realisme_module, "PAUSE_ENTRE_RECHERCHES_SECONDES", 0.0)
+    monkeypatch.setattr(agent_realisme_module, "DDGS", lambda: _DDGSFactice())
+
+    anomalies = [_anomalie_brute()]
+    assert _verifier_avec_recherche_web(NOM_FICHIER_TEST, anomalies, _ClientExplosif()) == anomalies
+
+
+def test_analyser_appelle_la_verification_web_si_activee(monkeypatch):
+    import agents.agent_realisme as agent_realisme_module
+    monkeypatch.setattr(config, "RECHERCHE_WEB_ACTIVEE", True)
+    monkeypatch.setattr(agent_realisme_module, "PAUSE_ENTRE_RECHERCHES_SECONDES", 0.0)
+    monkeypatch.setattr(agent_realisme_module, "DDGS", lambda: _DDGSFactice())
+
+    reponse_analyse = ({"anomalies": [_anomalie_brute(ligne=0)]}, AppelMetadata(modele="m", succes=True))
+    reponse_verif = ({"verifications": [{"index": 0, "confirmee": True, "raison": "ok"}]}, AppelMetadata(modele="m", succes=True))
+    client = _ClientFactice(reponses=[reponse_analyse, reponse_verif])
+
+    anomalies = analyser(NOM_FICHIER_TEST, _df_simple(2), client=client)
+
+    assert len(client.appels) == 2  # 1 analyse + 1 vérification
+    assert len(anomalies) == 1

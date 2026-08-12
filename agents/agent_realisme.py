@@ -7,8 +7,10 @@ l'automobile (marques, modèles, puissances, prix, carburants, années...),
 schema-agnostic comme les détecteurs précédents. Différent de l'agent
 Cohérence (incohérence logique ENTRE plusieurs champs d'une même ligne, ex.
 date_fin < date_debut) : Réalisme juge si une valeur a un sens dans le monde
-réel, en s'appuyant sur les connaissances générales du modèle — pas de
-recherche web à ce stade (voir agents/regles_realisme.md, limite connue).
+réel, en s'appuyant sur les connaissances générales du modèle, puis vérifie
+ses propres anomalies candidates par une recherche web (bibliothèque `ddgs`,
+DuckDuckGo, gratuite, sans clé API) avant de les retenir — voir
+« Vérification web » dans agents/regles_realisme.md.
 
 100% des anomalies produites ont type="realisme" et source="llm" : ces deux
 champs sont réécrits après coup, jamais laissés tels que renvoyés par le
@@ -25,10 +27,12 @@ Usage :
 
 import json
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
+from ddgs import DDGS
 from loguru import logger
 from tabulate import tabulate
 
@@ -46,6 +50,12 @@ from ingestion.local_loader import LocalLoader
 
 TYPE_ANOMALIE = "realisme"
 SOURCE_ANOMALIE = "llm"
+
+# Graine de l'échantillonnage des fichiers géants (voir analyser()) : un
+# tirage reproductible plutôt qu'aléatoire à chaque run, pour pouvoir
+# comparer deux exécutions sur le même fichier. Valeur locale à ce module,
+# comme SEED_ECHANTILLONNAGE dans agents/agent_coherence.py.
+SEED_ECHANTILLONNAGE = 42
 
 PROMPT_SYSTEME_BASE = (
     "Tu es un auditeur expert du marché automobile, spécialisé dans les données "
@@ -75,6 +85,28 @@ PROMPT_SYSTEME_BASE = (
     "courte de la valeur posant problème), justification (explication en une "
     "phrase), confiance (nombre entre 0.0 et 1.0). N'invente jamais d'anomalie "
     'pour remplir la réponse : si rien n\'est invraisemblable, réponds {"anomalies": []}.'
+)
+
+# Nombre de résultats de recherche web récupérés par anomalie candidate.
+NB_RESULTATS_RECHERCHE = 3
+# Pause entre deux recherches ddgs (limite le risque de blocage par DuckDuckGo).
+PAUSE_ENTRE_RECHERCHES_SECONDES = 1.0
+
+PROMPT_VERIFICATION_SYSTEME = (
+    "Tu as précédemment signalé des anomalies de réalisme sur des données de "
+    "location automobile, à partir de tes seules connaissances internes. On "
+    "te montre maintenant, pour chacune, un extrait de résultats de recherche "
+    "web récents. Ta tâche : dire si chaque anomalie reste valide, ou doit "
+    "être RETIRÉE parce que le web montre clairement que ton évaluation "
+    "initiale était fausse (ex. un modèle que tu pensais inexistant apparaît "
+    "bien dans des résultats récents et fiables).\n\n"
+    "Par défaut, GARDE l'anomalie (confirmee=true) : ne la retire que si la "
+    "preuve web est claire et directement pertinente. Des résultats vides, "
+    "hors sujet ou contradictoires entre eux ne suffisent PAS à retirer une "
+    "anomalie.\n\n"
+    "Réponds UNIQUEMENT en JSON strict, sans texte autour ni bloc markdown : "
+    '{"verifications": [{"index": 0, "confirmee": true, "raison": "..."}, ...]}, '
+    "un objet par anomalie fournie, dans le même ordre, avec le même index (0-based)."
 )
 
 
@@ -123,6 +155,110 @@ def _decouper_en_chunks(df: pd.DataFrame, taille_chunk: int) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Vérification web des anomalies candidates
+# ---------------------------------------------------------------------------
+
+
+def _construire_requete_recherche(anomalie: dict) -> str:
+    """Requête de recherche à partir des champs déjà produits par le modèle (schema-agnostic : aucune hypothèse sur les noms de colonnes du fichier)."""
+    valeur = str(anomalie.get("valeur", "")).strip()
+    colonnes = " ".join(anomalie.get("colonnes") or [])
+    return f"{valeur} {colonnes}".strip()
+
+
+def _rechercher_web(requete: str) -> str:
+    """
+    Recherche web via DuckDuckGo (bibliothèque `ddgs`, gratuite, sans clé
+    API). Ne lève jamais d'exception : un échec (réseau, blocage DDG,
+    requête vide, aucun résultat) retourne une chaîne vide, journalisé en
+    warning — jamais bloquant pour le pipeline.
+    """
+    if not requete.strip():
+        return ""
+    try:
+        resultats = DDGS().text(requete, max_results=NB_RESULTATS_RECHERCHE)
+    except Exception as erreur:
+        logger.warning(f"Recherche web échouée pour {requete!r} : {erreur}")
+        return ""
+
+    if not resultats:
+        return ""
+    return "\n".join(f"- {r.get('title', '')} : {r.get('body', '')}" for r in resultats)
+
+
+def _construire_prompt_verification_utilisateur(anomalies: list, resultats_recherche: list) -> str:
+    blocs = []
+    for i, (anomalie, resultat) in enumerate(zip(anomalies, resultats_recherche)):
+        blocs.append(
+            f"### Anomalie {i}\n"
+            f"Colonne(s) : {', '.join(anomalie.get('colonnes') or [])}\n"
+            f"Valeur signalée : {anomalie.get('valeur')}\n"
+            f"Justification initiale : {anomalie.get('justification')}\n"
+            f"Résultats de recherche web :\n{resultat or '(aucun résultat trouvé)'}"
+        )
+    return "\n\n".join(blocs)
+
+
+def _verifier_avec_recherche_web(nom_fichier: str, anomalies: list, client: LLMClient) -> list:
+    """
+    Deuxième passe, un seul appel LLM pour tout le chunk (pas un par
+    anomalie) : confronte chaque anomalie candidate à un extrait de
+    recherche web et retire celles que le modèle juge contredites par des
+    preuves claires. Défensif à chaque étape (recherche, appel LLM,
+    parsing) : le moindre échec conserve les anomalies candidates telles
+    quelles plutôt que de perdre du signal. Coupable via
+    config.RECHERCHE_WEB_ACTIVEE. Voir agents/regles_realisme.md.
+    """
+    if not config.RECHERCHE_WEB_ACTIVEE:
+        return anomalies
+
+    resultats_recherche = []
+    for anomalie in anomalies:
+        resultats_recherche.append(_rechercher_web(_construire_requete_recherche(anomalie)))
+        time.sleep(PAUSE_ENTRE_RECHERCHES_SECONDES)
+
+    if not any(resultats_recherche):
+        logger.warning(f"{nom_fichier} : aucun résultat de recherche web, anomalies conservées sans vérification.")
+        return anomalies
+
+    try:
+        reponse, metadata = client.appeler(
+            system_prompt=PROMPT_VERIFICATION_SYSTEME,
+            user_prompt=_construire_prompt_verification_utilisateur(anomalies, resultats_recherche),
+            model=config.MODELES["realisme"],
+            temperature=config.TEMPERATURES["realisme"],
+            max_tokens=config.MAX_TOKENS["realisme"],
+            json_attendu=True,
+        )
+    except Exception as erreur:
+        logger.warning(f"{nom_fichier} : appel de vérification web échoué ({erreur}), anomalies conservées telles quelles.")
+        return anomalies
+
+    if not metadata.succes or not isinstance(reponse, dict):
+        logger.warning(f"{nom_fichier} : réponse de vérification web invalide, anomalies conservées telles quelles.")
+        return anomalies
+
+    verifications = {
+        v.get("index"): v
+        for v in (reponse.get("verifications") or [])
+        if isinstance(v, dict) and isinstance(v.get("index"), int)
+    }
+
+    anomalies_confirmees = []
+    for i, anomalie in enumerate(anomalies):
+        verif = verifications.get(i)
+        if verif is not None and verif.get("confirmee") is False:
+            logger.info(
+                f"{nom_fichier} : anomalie retirée après vérification web (colonne(s) "
+                f"{anomalie.get('colonnes')}, valeur={anomalie.get('valeur')!r}) : {verif.get('raison', '')}"
+            )
+            continue
+        anomalies_confirmees.append(anomalie)
+
+    return anomalies_confirmees
+
+
+# ---------------------------------------------------------------------------
 # Appel LLM par chunk
 # ---------------------------------------------------------------------------
 
@@ -164,6 +300,9 @@ def _analyser_chunk(nom_fichier: str, chunk: pd.DataFrame, client: LLMClient, nu
         anomalie["type"] = TYPE_ANOMALIE
         anomalie["source"] = SOURCE_ANOMALIE
 
+    if anomalies_validees:
+        anomalies_validees = _verifier_avec_recherche_web(nom_fichier, anomalies_validees, client)
+
     logger.info(
         f"{nom_fichier} chunk {num_chunk}/{nb_chunks} : {len(anomalies_validees)} anomalie(s) "
         f"de réalisme (modèle={metadata.modele}, depuis_cache={metadata.depuis_cache})."
@@ -179,10 +318,16 @@ def _analyser_chunk(nom_fichier: str, chunk: pd.DataFrame, client: LLMClient, nu
 def analyser(nom_fichier: str, df: pd.DataFrame, client: LLMClient | None = None) -> list:
     """
     Découpe df en chunks (config.CHUNK_SIZE) et interroge l'agent Réalisme sur
-    chacun, en tronquant d'abord à config.MAX_LIGNES_PAR_FICHIER lignes si
-    celui-ci est non nul (0 = fichier complet). Retourne la liste agrégée des
-    anomalies, chacune conforme à docs/contrat_anomalie.md avec
-    type="realisme" et source="llm".
+    chacun. Retourne la liste agrégée des anomalies, chacune conforme à
+    docs/contrat_anomalie.md avec type="realisme" et source="llm".
+
+    Un fichier "géant" (> config.SEUIL_FICHIER_GEANT lignes) est échantillonné
+    à config.MAX_LIGNES_PAR_FICHIER lignes (tirage aléatoire reproductible,
+    SEED_ECHANTILLONNAGE, index d'origine retrié après tirage) ; en dessous de
+    ce seuil, le fichier est traité intégralement, sans troncature. Même
+    règle que agents/agent_coherence.py (`SEED_ECHANTILLONNAGE` différente,
+    définie localement à chaque module), pour un comportement cohérent entre
+    les deux agents LLM sur les plus gros fichiers — voir regles_realisme.md.
 
     Ne lève jamais d'exception. Un DataFrame vide retourne [] immédiatement,
     sans consommer de requête LLM.
@@ -190,12 +335,13 @@ def analyser(nom_fichier: str, df: pd.DataFrame, client: LLMClient | None = None
     if df is None or df.empty:
         return []
 
-    if config.MAX_LIGNES_PAR_FICHIER > 0 and len(df) > config.MAX_LIGNES_PAR_FICHIER:
+    if len(df) > config.SEUIL_FICHIER_GEANT:
+        taille_echantillon = min(config.MAX_LIGNES_PAR_FICHIER, len(df))
         logger.warning(
-            f"{nom_fichier} : {len(df)} lignes tronquées à {config.MAX_LIGNES_PAR_FICHIER} "
-            "(config.MAX_LIGNES_PAR_FICHIER) pour limiter la consommation de requêtes LLM."
+            f"{nom_fichier} : fichier géant ({len(df)} lignes), échantillon de "
+            f"{taille_echantillon} lignes (seed={SEED_ECHANTILLONNAGE})."
         )
-        df = df.head(config.MAX_LIGNES_PAR_FICHIER)
+        df = df.sample(n=taille_echantillon, random_state=SEED_ECHANTILLONNAGE).sort_index()
 
     client = client or LLMClient()
     chunks = _decouper_en_chunks(df, config.CHUNK_SIZE)

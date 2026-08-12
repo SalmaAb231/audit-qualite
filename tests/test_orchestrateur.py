@@ -5,6 +5,15 @@ Aucun appel réseau réel : un client LLM factice (repris du même motif que
 tests/test_agent_realisme.py) simule agents.llm_client.LLMClient.appeler().
 Les tests qui touchent le disque (résultats, rapports) utilisent tmp_path.
 
+agents.agent_coherence fixe ses dossiers de résultats/checkpoints en
+constantes de module (calculées à l'import, donc jamais rechargées si on
+monkeypatch config.RESULTATS_DIR en cours de test) : une autouse fixture
+redirige directement ces constantes vers tmp_path, pour qu'aucun test
+n'écrive dans le vrai dossier resultats/coherence/. Une deuxième autouse
+fixture désactive config.RECHERCHE_WEB_ACTIVEE (agents/agent_realisme.py) :
+sans elle, un chunk Réalisme avec au moins une anomalie ferait un vrai
+appel réseau ddgs pendant les tests.
+
 Usage :
     python -m pytest tests/test_orchestrateur.py -v
 """
@@ -15,12 +24,27 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import agents.agent_coherence as agent_coherence_module
 import config
 import orchestrateur
 from agents.llm_client import AppelMetadata
 from ingestion.local_loader import FichierInfo
 
 NOM_FICHIER_TEST = "test.xlsx"
+
+
+@pytest.fixture(autouse=True)
+def _isoler_dossiers_coherence(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_coherence_module, "DOSSIER_RESULTATS", tmp_path / "coherence")
+    monkeypatch.setattr(agent_coherence_module, "DOSSIER_CHECKPOINTS", tmp_path / "coherence" / "checkpoints")
+
+
+@pytest.fixture(autouse=True)
+def _desactiver_recherche_web_par_defaut(monkeypatch):
+    # Sans ça, un chunk Réalisme avec au moins une anomalie déclenche un
+    # vrai appel réseau ddgs (voir agents/agent_realisme.py) — jamais
+    # souhaitable dans ces tests.
+    monkeypatch.setattr(config, "RECHERCHE_WEB_ACTIVEE", False)
 
 
 def _info(nom=NOM_FICHIER_TEST, dossier_mois="LOAD_LOCK_202603"):
@@ -119,7 +143,9 @@ def test_lignes_suspectes_sans_echantillon_de_controle(monkeypatch):
 def test_pipeline_fichier_court_circuite_sur_critical_structure():
     df_vide = pd.DataFrame()  # verifier_fichier_vide -> critical -> fichier_exploitable() == False
 
-    verdict = orchestrateur.pipeline_fichier(_info(), df_vide, client=_ClientExplosif())
+    verdict = orchestrateur.pipeline_fichier(
+        _info(), df_vide, client=_ClientExplosif(), coherence_client=_ClientExplosif()
+    )
 
     assert verdict["verdict"] == "REJECTED"
     assert verdict["dossier_mois"] == "LOAD_LOCK_202603"
@@ -132,17 +158,51 @@ def test_pipeline_fichier_flux_complet_integre_les_anomalies_realisme(monkeypatc
     # Une ligne dupliquée (index 2) donne une anomalie structure avec ligne=2 != 0,
     # donc _lignes_suspectes sélectionne bien au moins cette ligne : garantit que
     # analyser_realisme reçoit un lot non vide et appelle le client factice.
+    # Cohérence est bien invoquée (chemin factice de _info() -> son propre
+    # chargement échoue -> [] sans appel réseau, voir AgentCoherence.analyser_fichier).
     df = pd.DataFrame({"Modele": ["A", "B", "A", "C", "D"], "Prix": [1, 2, 1, 3, 4]})
 
     reponse = ({"anomalies": [_anomalie_realisme(ligne=2)]}, AppelMetadata(modele="m", succes=True))
     client = _ClientFactice(reponses=[reponse])
 
-    verdict = orchestrateur.pipeline_fichier(_info(), df, client=client, random_state=0)
+    verdict = orchestrateur.pipeline_fichier(
+        _info(), df, client=client, coherence_client=_ClientExplosif(), random_state=0
+    )
 
     assert len(client.appels) == 1
     assert verdict["anomalies_par_type"]["realisme"] == 1
     assert verdict["dossier_mois"] == "LOAD_LOCK_202603"
     assert any(a["type"] == "realisme" for a in verdict["anomalies"])
+
+
+def test_pipeline_fichier_integre_les_anomalies_coherence(monkeypatch):
+    # Stats et Cohérence tournent en parallèle sur tout le fichier ; leurs
+    # anomalies combinées alimentent _lignes_suspectes et le verdict final.
+    monkeypatch.setattr(config, "TAUX_ECHANTILLON_CONTROLE", 0.0)
+    df = pd.DataFrame({"Modele": ["A", "B", "C", "D", "E"], "Prix": [10, 20, 30, 40, 50]})
+
+    # AgentCoherence charge elle-même le fichier depuis info.chemin : on
+    # redirige LocalLoader.charger (classe partagée avec orchestrateur.py)
+    # pour qu'elle reçoive ce df sans toucher au disque.
+    monkeypatch.setattr(orchestrateur.LocalLoader, "charger", lambda self, chemin: df)
+
+    anomalie_coherence = {
+        "fichier": NOM_FICHIER_TEST, "ligne": 3, "colonnes": ["Modele", "Prix"], "type": "coherence",
+        "severite": "high", "source": "llm", "valeur": "peu importe",
+        "justification": "incohérence factice", "confiance": 0.85,
+    }
+    coherence_client = _ClientFactice(
+        reponses=[({"anomalies": [anomalie_coherence]}, AppelMetadata(modele="m", succes=True))]
+    )
+    realisme_client = _ClientFactice(reponses=[({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
+
+    verdict = orchestrateur.pipeline_fichier(
+        _info(), df, client=realisme_client, coherence_client=coherence_client, random_state=0
+    )
+
+    assert len(coherence_client.appels) == 1
+    assert verdict["anomalies_par_type"]["coherence"] == 1
+    assert any(a["type"] == "coherence" and a["ligne"] == 3 for a in verdict["anomalies"])
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +236,11 @@ def test_main_traite_un_fichier_et_ecrit_les_resultats(monkeypatch, tmp_path):
     monkeypatch.setattr(orchestrateur.LocalLoader, "lister_fichiers", lambda self: [info])
     monkeypatch.setattr(orchestrateur.LocalLoader, "charger", lambda self, chemin: df)
 
-    verdicts = orchestrateur.main(client=_ClientFactice(reponses=[]))
+    # AgentCoherence charge aussi via LocalLoader.charger (mocké ci-dessus) :
+    # son chargement réussit donc ici, elle atteint bien l'appel LLM.
+    coherence_client = _ClientFactice(reponses=[({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
+
+    verdicts = orchestrateur.main(client=_ClientFactice(reponses=[]), coherence_client=coherence_client)
 
     assert len(verdicts) == 1
     dossier_sortie = tmp_path / "LOAD_LOCK_202604"
@@ -206,7 +270,7 @@ def test_main_continue_apres_lechec_dun_fichier(monkeypatch, tmp_path):
 
     appels = {"n": 0}
 
-    def _pipeline_qui_casse_une_fois(info, df, client=None, random_state=None):
+    def _pipeline_qui_casse_une_fois(info, df, client=None, coherence_client=None, random_state=None):
         appels["n"] += 1
         if info.nom == "casse.xlsx":
             raise RuntimeError("panne simulée")

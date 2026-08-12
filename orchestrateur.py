@@ -1,21 +1,19 @@
 """
 Orchestrateur du pipeline audit-qualite.
 
-Le chef de gare : pour chaque fichier, enchaîne structure/ (portier,
-arrête tout appel LLM si critical) -> stats/ (toutes les lignes) ->
-Réalisme (uniquement les lignes suspectes + un échantillon aléatoire de
-contrôle, voir _lignes_suspectes) -> judge/ (verdict) -> reporting/
-(rapport HTML par fichier), puis un rapport consolidé sur l'ensemble des
-fichiers traités dans cette exécution.
-
-Cohérence n'existe pas encore dans le dépôt (module en cours côté binôme) :
-ce pipeline tourne sans elle pour l'instant — Structure + Stats + Réalisme
-seulement. Le jour où agents/agent_coherence.py existe, l'ajouter dans
-pipeline_fichier() (anomalies + entrée de _lignes_suspectes) suffit, sans
-changement structurel ailleurs.
+Le chef de gare : pour chaque fichier, enchaîne structure/ (portier, arrête
+tout appel LLM si critical) -> stats/ ET Cohérence EN PARALLÈLE (chacun lit
+tout le fichier, canaux indépendants) -> Réalisme (lignes suspectes
+pointées par structure/stats/Cohérence + un échantillon aléatoire de
+contrôle, voir _lignes_suspectes ; connaissances internes du modèle
+uniquement, PAS de recherche web — voir « Limite : pas de recherche web »
+plus bas) -> judge/ (verdict) -> reporting/ (rapport HTML par fichier), puis
+un rapport consolidé sur l'ensemble des fichiers traités dans cette
+exécution.
 
 Voir regles_orchestrateur.md pour les décisions de conception (sélection
-des lignes suspectes, garde-fou de quota, un dossier de résultats par mois).
+des lignes suspectes, garde-fou de quota, un dossier de résultats par mois,
+coût en requêtes de Cohérence sur tout le fichier).
 
 Usage :
     python -m orchestrateur                          # tous les fichiers de DATA_DIR
@@ -24,6 +22,7 @@ Usage :
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -33,6 +32,7 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
+from agents.agent_coherence import AgentCoherence
 from agents.agent_realisme import analyser as analyser_realisme
 from agents.llm_client import quota_restant
 from ingestion.local_loader import LocalLoader
@@ -87,13 +87,33 @@ def _lignes_suspectes(df: pd.DataFrame, anomalies: list, random_state=None) -> p
 # ---------------------------------------------------------------------------
 
 
-def pipeline_fichier(info, df: pd.DataFrame, client=None, random_state=None) -> dict:
+def _analyser_coherence(info, llm_client=None) -> list:
+    """
+    Lance l'agent Cohérence (agents/agent_coherence.py) sur le fichier
+    complet et retourne ses anomalies. Canal indépendant de stats/ : elle
+    recharge elle-même le fichier depuis le disque (ne partage pas le df
+    déjà chargé par l'orchestrateur) et ré-exécute son propre garde d'entrée
+    structure/ — redondant avec celui de pipeline_fichier(), sans incidence
+    sur le résultat (structure/ est déterministe et rapide), voir
+    regles_orchestrateur.md. Gère elle-même son checkpoint et sauvegarde
+    son résultat complet dans resultats/coherence/<fichier>.json.
+    """
+    resultat = AgentCoherence(llm_client=llm_client).analyser_fichier(info.chemin)
+    return resultat.get("anomalies", [])
+
+
+def pipeline_fichier(info, df: pd.DataFrame, client=None, coherence_client=None, random_state=None) -> dict:
     """
     Exécute le pipeline complet sur un fichier déjà chargé. `info` est le
     FichierInfo (ingestion.local_loader) du fichier : fournit son nom et
-    son dossier_mois d'origine, ajoutés au verdict retourné. `client` est
-    injectable pour les tests (voir tests/test_orchestrateur.py) ; None en
-    production crée un LLMClient réel (comportement de agent_realisme.analyser).
+    son dossier_mois d'origine, ajoutés au verdict retourné. `client`
+    (Réalisme) et `coherence_client` (Cohérence) sont injectables pour les
+    tests (voir tests/test_orchestrateur.py) ; None en production crée un
+    LLMClient réel pour chacun.
+
+    Stats et Cohérence tournent en parallèle (deux canaux indépendants qui
+    lisent chacun tout le fichier) : leurs résultats combinés alimentent la
+    sélection des lignes envoyées à Réalisme et le calcul du verdict final.
 
     Ne lève jamais d'exception métier : une anomalie critical en Structure
     court-circuite le reste (aucun appel LLM consommé). Le verdict retourné
@@ -113,15 +133,22 @@ def pipeline_fichier(info, df: pd.DataFrame, client=None, random_state=None) -> 
         verdict["anomalies"] = anomalies_structure
         return verdict
 
-    anomalies_stats = analyser_stats(nom_fichier, df)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futur_stats = executor.submit(analyser_stats, nom_fichier, df)
+        futur_coherence = executor.submit(_analyser_coherence, info, coherence_client)
+        anomalies_stats = futur_stats.result()
+        anomalies_coherence = futur_coherence.result()
     logger.info(f"  Stats : {len(anomalies_stats)} anomalie(s)")
+    logger.info(f"  Cohérence : {len(anomalies_coherence)} anomalie(s)")
 
-    lot_suspect = _lignes_suspectes(df, anomalies_structure + anomalies_stats, random_state=random_state)
+    lot_suspect = _lignes_suspectes(
+        df, anomalies_structure + anomalies_stats + anomalies_coherence, random_state=random_state
+    )
     logger.info(f"  Réalisme : {len(lot_suspect)}/{len(df)} ligne(s) envoyée(s) (suspectes + échantillon de contrôle)")
     anomalies_realisme = analyser_realisme(nom_fichier, lot_suspect, client=client)
     logger.info(f"  Réalisme : {len(anomalies_realisme)} anomalie(s)")
 
-    toutes_anomalies = anomalies_structure + anomalies_stats + anomalies_realisme
+    toutes_anomalies = anomalies_structure + anomalies_stats + anomalies_coherence + anomalies_realisme
     verdict = analyser_judge(nom_fichier, toutes_anomalies)
     verdict["dossier_mois"] = info.dossier_mois
     verdict["anomalies"] = toutes_anomalies
@@ -158,7 +185,7 @@ def _sauvegarder_resultats_fichier(info, verdict: dict) -> None:
     (dossier / f"rapport_{stem}.html").write_text(rapport, encoding="utf-8")
 
 
-def main(noms_fichiers: list | None = None, client=None) -> list:
+def main(noms_fichiers: list | None = None, client=None, coherence_client=None) -> list:
     """
     Traite les fichiers demandés (tous ceux de DATA_DIR si noms_fichiers est
     vide) et retourne la liste des verdicts produits. S'arrête proprement
@@ -186,7 +213,7 @@ def main(noms_fichiers: list | None = None, client=None) -> list:
             continue
 
         try:
-            verdict = pipeline_fichier(info, df, client=client)
+            verdict = pipeline_fichier(info, df, client=client, coherence_client=coherence_client)
         except Exception as erreur:
             logger.error(f"[{i}/{len(fichiers)}] {info.nom} : échec du pipeline ({erreur})", exc_info=True)
             continue
