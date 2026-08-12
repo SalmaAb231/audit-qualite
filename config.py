@@ -83,8 +83,9 @@ MODELES = {
     # Contrainte dure : tool calling fiable pour la recherche web autonome
     # → gpt-oss-120b : tool calling natif + sorties structurées
     "realisme": [
-        "openai/gpt-oss-120b:free",
         "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "google/gemma-4-31b-it:free",        # supporte les tools aussi
+        "openai/gpt-oss-20b:free",           # si encore présent au catalogue
     ],
 
     # Tâche simple (justification du verdict, quelques phrases) → modèle léger
@@ -157,12 +158,12 @@ COMPTEUR_REQUETES_FICHIER = CACHE_LLM_DIR / "compteur_quotidien.json"
 # ---------------------------------------------------------------------------
 # Découpage des données envoyées aux agents LLM
 # ---------------------------------------------------------------------------
-
-# Nombre de lignes de données envoyées par appel LLM (chunk).
-# Compromis : gros chunks = moins de requêtes (précieux à 50/jour), mais
-# réponse JSON plus longue et risque que le modèle rate des anomalies au
-# milieu du chunk. Rester entre 50 et 100 ; affiner sur le jeu de validation.
-CHUNK_SIZE = 80
+# Lignes de données par appel LLM (unique constante de chunking, commune aux
+# agents Cohérence et Réalisme). 500 = compromis retenu : ~15-18K tokens par
+# chunk (compatible avec le plus petit contexte des cascades, 131K), risque
+# limité de troncature de la réponse JSON et de dilution d'attention, tout en
+# restant viable en quota gratuit (~3 400 appels pour le run Cohérence complet).
+CHUNK_SIZE = 500
 
 # Nombre maximal de lignes envoyées au LLM par fichier (0 = fichier complet).
 # Sert à échantillonner les gros fichiers pendant le DÉVELOPPEMENT pour
@@ -193,6 +194,38 @@ PONDERATION_SEVERITE = {
     "medium": 0.4,
     "low": 0.2,
 }
+
+# ---------------------------------------------------------------------------
+# Judge : score, grade, verdict (judge/agent_judge.py)
+# ---------------------------------------------------------------------------
+# Une anomalie 'critical' compte double dans le calcul de pénalité (son
+# poids PONDERATION_SEVERITE["critical"] est multiplié par ce facteur, les
+# autres sévérités restent inchangées).
+FACTEUR_PENALITE_CRITICAL = 2.0
+
+# Notes de A à F par tranche de score (borne inférieure incluse). Parcourues
+# dans cet ordre : la première tranche atteinte l'emporte, sinon "F".
+SEUILS_GRADE = {
+    "A": 0.95,
+    "B": 0.85,
+    "C": 0.70,
+    "D": 0.50,
+}
+
+# Plafond de la pénalité cumulée des sévérités "non bloquantes" (medium et
+# low, voir docs/contrat_anomalie.md — "high"/"critical" restent sans
+# plafond). Découvert en calibrant sur données réelles déjà validées : sans
+# ce plafond, un détecteur purement mathématique (stats/) peut accumuler des
+# milliers d'anomalies medium/low sur un gros fichier (ex. un léger écart
+# d'arrondi répété sur 200 000 lignes) et fait chuter le score à 0, alors
+# qu'aucune de ces anomalies n'est individuellement bloquante. Avec ce
+# plafond, stats/ seul (qui ne produit jamais de high/critical) ne peut
+# jamais faire descendre un fichier sous WARNING — cohérent avec la
+# séparation déjà établie ("stats/ ne décide jamais qu'un fichier est
+# inexploitable", rôle réservé à structure/). Valeur choisie pour que le
+# pire cas (uniquement du medium/low, peu importe la quantité) atterrisse
+# exactement à la frontière SEUIL_WARNING : 1.0 - 0.25 = 0.75.
+PLAFOND_PENALITE_NON_BLOQUANTE = 0.25
 
 # Types d'anomalies autorisés (voir docs/contrat_anomalie.md)
 TYPES_ANOMALIE = ("structure", "statistique", "coherence", "realisme")

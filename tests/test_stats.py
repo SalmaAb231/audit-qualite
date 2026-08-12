@@ -55,6 +55,14 @@ def test_verifier_outliers_numeriques_ignore_sous_le_minimum():
     assert verifier_outliers_numeriques(NOM_FICHIER_TEST, df) == []
 
 
+def test_verifier_outliers_numeriques_exclut_les_colonnes_booleennes():
+    # pandas considère bool comme "numérique" (is_numeric_dtype) ; sans exclusion,
+    # q3 - q1 plante avec TypeError sur certaines valeurs bool (crash réel
+    # rencontré sur NL_B2C_AYV_OFF.xlsx, voir stats/regles.md).
+    df = pd.DataFrame({"EstActif": [True, False, True, True, False, True, False, True, True, False, True, True]})
+    assert verifier_outliers_numeriques(NOM_FICHIER_TEST, df) == []
+
+
 # ---------------------------------------------------------------------------
 # verifier_valeurs_negatives_minoritaires
 # ---------------------------------------------------------------------------
@@ -142,6 +150,19 @@ def test_verifier_incoherence_entre_colonnes_detecte():
 
 def test_verifier_incoherence_entre_colonnes_df_sain():
     assert verifier_incoherence_entre_colonnes(NOM_FICHIER_TEST, _construire_df_correles(rupture=False)) == []
+
+
+def test_verifier_incoherence_entre_colonnes_exclut_les_paires_a_faible_cardinalite():
+    # Deux colonnes quasi-catégorielles (peu de valeurs distinctes) très
+    # corrélées : sans exclusion, l'IQR des résidus est quasi nul et la
+    # moindre variation normale devient une "anomalie" en masse (découvert
+    # sur NL_B2B_AYV_OFF.xlsx : 2598 lignes sur 25572 pour une seule paire
+    # de ce type — voir stats/regles.md).
+    n = 40
+    cylindres = ([0] * 10 + [4] * 20 + [6] * 10)  # 2 valeurs distinctes seulement
+    carte = ([2.52] * 9 + [3.52] + [2.52] * 19 + [3.52] + [2.52] * 9 + [3.52])  # 2 valeurs, quasi alignées
+    df = pd.DataFrame({"Cylindres": cylindres, "Carte": carte})
+    assert verifier_incoherence_entre_colonnes(NOM_FICHIER_TEST, df) == []
 
 
 def test_verifier_incoherence_entre_colonnes_sans_correlation():

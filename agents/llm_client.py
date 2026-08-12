@@ -120,6 +120,11 @@ def _incrementer_compteur_quotidien() -> int:
     return compteur
 
 
+def quota_restant() -> int:
+    """Nombre de requêtes encore disponibles aujourd'hui avant blocage (config.RATE_LIMIT['max_requetes_jour'])."""
+    return max(0, config.RATE_LIMIT["max_requetes_jour"] - _lire_compteur_quotidien())
+
+
 class LLMClient:
     """
     Client d'appel à l'API OpenRouter, avec cascade de modèles, retries

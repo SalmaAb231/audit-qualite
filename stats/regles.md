@@ -102,6 +102,34 @@ signifie que l'anomalie concerne une colonne entière, pas une ligne précise.
 - Une ligne qui casse plusieurs paires de colonnes ne produit qu'**une
   seule** anomalie agrégée (toutes les colonnes impliquées listées
   ensemble), pas une par paire cassée.
+- **Deuxième limite découverte en testant sur données réelles, plus grave
+  que la première** : sur un lot de 59 fichiers réels de `LOAD_LOCK_202604`
+  (considérés sans problème, déjà validés par des experts), ce check
+  produisait jusqu'à 13 437 anomalies sur un seul fichier
+  (`NL_B2B_DIL_ALL_PART1.xlsx`, 213 220 lignes) et 3 378 sur un autre
+  (`NL_B2B_AYV_OFF.xlsx`, 25 572 lignes) — assez pour saturer le score du
+  Judge à 0 quel que soit le contenu réel du fichier. Cause identifiée :
+  une colonne quasi-catégorielle encodée en nombre (ex. `engineCylinders`,
+  4 valeurs distinctes : 0/3/4/6 ; ou un code "Tank- en/of laadpas", 2
+  valeurs) affiche une corrélation de rang très élevée (0.92) avec une
+  autre colonne discrète sans aucune relation métier réelle — l'IQR des
+  résidus de la régression devient quasi nul, donc les bornes
+  `[-0.01, 0.05]` transforment n'importe quelle petite variation normale
+  en anomalie (10% des lignes flaggées pour une seule paire). Corrigé en
+  excluant les colonnes à faible cardinalité (`SEUIL_CARDINALITE_MIN_PAIRE
+  = 10` valeurs distinctes minimum) de ce check, en plus des colonnes
+  booléennes (mêmes symptômes, cardinalité 2).
+- **Effet de bord accepté** : même après ce correctif, des paires de
+  colonnes réellement continues mais quasi-redondantes (ex. `Power_kW` /
+  `Power_hp`, deux unités de la même grandeur physique) peuvent encore
+  produire quelques milliers d'anomalies sur les plus gros fichiers
+  (`Power_kW` vs `FiscalValue` : 3 720 lignes sur 213 220, soit 1.7%) —
+  chaque écart individuel (probablement un arrondi) reste statistiquement
+  correct à signaler, mais le **volume brut** croît avec la taille du
+  fichier sans rapport avec la gravité réelle du problème. Ce n'est plus
+  corrigé ici : voir `judge/regles_judge.md` (plafond de pénalité) pour la
+  solution retenue — normaliser au niveau du calcul de score plutôt que de
+  supprimer des anomalies individuellement correctes.
 
 ## Ce que ce module ne fait pas
 

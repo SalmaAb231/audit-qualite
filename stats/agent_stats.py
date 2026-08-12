@@ -58,6 +58,12 @@ SEUIL_CORRELATION_MIN = 0.7
 FACTEUR_IQR_RESIDUS = 3.5  # plus strict que FACTEUR_IQR : voir verifier_incoherence_entre_colonnes
 SEUIL_MIN_PAIRES_VALEURS = 30
 NB_PAIRES_MAX_TRAITEES = 20
+# Sous ce nombre de valeurs distinctes, une colonne se comporte comme une
+# catégorie encodée en nombre (ex. un code, ~2-4 valeurs) plutôt que comme
+# une grandeur continue : une régression linéaire + IQR sur les résidus n'a
+# pas de sens statistique dans ce cas (découvert sur données réelles, voir
+# stats/regles.md).
+SEUIL_CARDINALITE_MIN_PAIRE = 10
 
 TYPE_ANOMALIE = "statistique"
 SOURCE_ANOMALIE = "stats"
@@ -105,11 +111,18 @@ def verifier_outliers_numeriques(nom_fichier: str, df: pd.DataFrame) -> list:
     Si plus de SEUIL_MAX_PART_OUTLIERS des valeurs sont hors bornes, la
     colonne n'est probablement pas unimodale : la méthode IQR n'est pas
     fiable dans ce cas, le check est ignoré pour cette colonne.
+
+    Exclut les colonnes booléennes : pandas les considère "numériques"
+    (is_numeric_dtype renvoie True), mais leur quantile reste de type bool
+    dans certains cas, et `q3 - q1` lève alors TypeError ("numpy boolean
+    subtract") — planté en test réel sur NL_B2C_AYV_OFF.xlsx (colonnes
+    isCommercial, hasNavigation...). Une colonne booléenne n'a de toute
+    façon pas de notion d'outlier IQR pertinente.
     """
     anomalies = []
     for i, colonne in enumerate(df.columns):
         serie = df.iloc[:, i]
-        if not pd.api.types.is_numeric_dtype(serie):
+        if not pd.api.types.is_numeric_dtype(serie) or pd.api.types.is_bool_dtype(serie):
             continue
 
         valeurs = serie.dropna()
@@ -155,7 +168,7 @@ def verifier_valeurs_negatives_minoritaires(nom_fichier: str, df: pd.DataFrame) 
     anomalies = []
     for i, colonne in enumerate(df.columns):
         serie = df.iloc[:, i]
-        if not pd.api.types.is_numeric_dtype(serie):
+        if not pd.api.types.is_numeric_dtype(serie) or pd.api.types.is_bool_dtype(serie):
             continue
 
         valeurs = serie.dropna()
@@ -290,10 +303,23 @@ def verifier_incoherence_entre_colonnes(nom_fichier: str, df: pd.DataFrame) -> l
 
     Agrégation par ligne : une ligne qui casse plusieurs paires ne produit
     qu'une seule anomalie (colonnes = union des colonnes impliquées).
+
+    Exclut les colonnes booléennes et celles à faible cardinalité
+    (< SEUIL_CARDINALITE_MIN_PAIRE valeurs distinctes) : découvert en testant
+    sur données réelles (NL_B2B_AYV_OFF.xlsx), une colonne quasi-catégorielle
+    encodée en nombre (ex. un code sur 2-4 valeurs) peut afficher une
+    corrélation de rang très élevée avec une autre colonne discrète sans
+    aucune relation métier réelle, et produire un nuage de "résidus" à IQR
+    quasi nul — donc des bornes ridiculement étroites qui transforment
+    n'importe quelle variation normale en avalanche de fausses anomalies
+    (observé : 2598 lignes sur 25572, soit 10%, pour une seule paire de ce
+    type). Voir stats/regles.md.
     """
     colonnes_numeriques = [
         colonne for i, colonne in enumerate(df.columns)
         if pd.api.types.is_numeric_dtype(df.iloc[:, i])
+        and not pd.api.types.is_bool_dtype(df.iloc[:, i])
+        and df.iloc[:, i].nunique() >= SEUIL_CARDINALITE_MIN_PAIRE
     ]
     if len(colonnes_numeriques) < 2:
         return []

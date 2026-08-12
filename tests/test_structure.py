@@ -60,11 +60,22 @@ def test_verifier_fichier_vide_df_sain():
 
 
 def test_verifier_colonnes_sans_nom_avec_donnees():
-    df = pd.DataFrame({"Nom": ["a", "b", "c"], "Unnamed: 3": [1, 2, 3]})
+    # Valeurs non séquentielles : un vrai décalage de colonnes, pas un index exporté.
+    df = pd.DataFrame({"Nom": ["a", "b", "c"], "Unnamed: 3": [42, 7, 15]})
     anomalies = verifier_colonnes_sans_nom(NOM_FICHIER_TEST, df)
     assert len(anomalies) == 1
     assert anomalies[0]["severite"] == "high"
     assert anomalies[0]["colonnes"] == ["Unnamed: 3"]
+
+
+def test_verifier_colonnes_sans_nom_index_exporte_non_bloquant():
+    # Séquence d'entiers consécutifs (0..n-1) : quasi certainement l'index
+    # pandas exporté par erreur, pas un décalage de colonnes — découvert sur
+    # NL_B2C_AYV_OFF.xlsx (voir structure/regles.md).
+    df = pd.DataFrame({"Nom": ["a", "b", "c"], "Unnamed: 0": [0, 1, 2]})
+    anomalies = verifier_colonnes_sans_nom(NOM_FICHIER_TEST, df)
+    assert len(anomalies) == 1
+    assert anomalies[0]["severite"] == "low"
 
 
 def test_verifier_colonnes_sans_nom_vide():
@@ -148,18 +159,20 @@ def test_verifier_lignes_dupliquees_df_sain():
 
 def _construire_df_manquantes():
     return pd.DataFrame({
-        "A": [1, 2, 3, 4] + [None] * 6,   # 6/10 = 60% -> medium
-        "B": [1] + [None] * 9,             # 9/10 = 90% -> high
+        "A": [1, 2, 3, 4] + [None] * 6,   # 6/10 = 60% -> low
+        "B": [1] + [None] * 9,             # 9/10 = 90% -> medium
         "C": [1, 2, 3, 4, 5, 6, 7] + [None] * 3,  # 3/10 = 30% -> rien
         "D": [None] * 10,                  # 100% -> exclu (couvert par verifier_colonnes_vides)
     })
 
 
 def test_verifier_taux_valeurs_manquantes():
+    # Sévérités volontairement non bloquantes (jamais high/critical) depuis la
+    # calibration sur données réelles : voir structure/regles.md.
     anomalies = verifier_taux_valeurs_manquantes(NOM_FICHIER_TEST, _construire_df_manquantes())
     par_colonne = {a["colonnes"][0]: a["severite"] for a in anomalies}
-    assert par_colonne["A"] == "medium"
-    assert par_colonne["B"] == "high"
+    assert par_colonne["A"] == "low"
+    assert par_colonne["B"] == "medium"
     assert "C" not in par_colonne
     assert "D" not in par_colonne
 

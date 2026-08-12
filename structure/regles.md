@@ -20,12 +20,21 @@ de ligne (index pandas 0-based de la première ligne dupliquée trouvée).
 
 ## `verifier_colonnes_sans_nom`
 
-- **Sévérité** : `high` si la colonne contient des données, `low` si elle est
-  entièrement vide.
+- **Sévérité** : `high` si la colonne contient des données qui ne semblent
+  pas être un index, `low` si elle est entièrement vide ou si ses valeurs
+  forment une séquence d'entiers consécutifs.
 - **Pourquoi** : une colonne sans nom (`Unnamed: N`, artefact pandas/Excel, ou
   nom vide/blanc) signale généralement un décalage de colonnes à l'export ou
   un en-tête mal renseigné. Si elle ne contient aucune donnée, c'est un simple
   artefact d'export sans impact (sévérité réduite).
+- **Cas particulier découvert en calibrant sur données réelles** :
+  `NL_B2C_AYV_OFF.xlsx` (`LOAD_LOCK_202604`) a une colonne `Unnamed: 0` dont
+  les 17171 valeurs sont exactement `0, 1, 2, ..., 17170` — l'index pandas
+  exporté par erreur (`to_csv`/`to_excel` sans `index=False`), pas un
+  décalage de colonnes. `_est_index_exporte` détecte ce motif (séquence
+  d'entiers consécutifs, dans l'ordre) et ramène la sévérité à `low` : c'est
+  un artefact d'export inoffensif pour le reste du fichier, pas un signe
+  fiable de corruption.
 
 ## `verifier_colonnes_dupliquees`
 
@@ -53,14 +62,27 @@ de ligne (index pandas 0-based de la première ligne dupliquée trouvée).
 
 ## `verifier_taux_valeurs_manquantes`
 
-- **Sévérité** : `medium` si le taux de valeurs manquantes est ≥ 50%,
-  `high` si ≥ 90%.
+- **Sévérité** : `low` si le taux de valeurs manquantes est ≥ 50%,
+  `medium` si ≥ 90%.
 - **Pourquoi** : une colonne majoritairement vide est peu fiable pour toute
   analyse statistique ou métier ultérieure. Les seuils sont des constantes
   (`SEUIL_NAN_MEDIUM`, `SEUIL_NAN_HIGH`) en haut du fichier, ajustables sans
   toucher à la logique.
 - Exclut les colonnes sans nom et les colonnes à 100% de NaN, déjà couvertes
   par les deux vérifications précédentes.
+- **Sévérités volontairement non bloquantes, révisées après calibration sur
+  données réelles** : à l'origine `high` au-delà de 90%, ce qui suffisait à
+  lui seul à faire REJETER un fichier (voir `judge/regles_judge.md`, plafond
+  des sévérités non bloquantes). Sur `LOAD_LOCK_202604` (fichiers déjà
+  validés par des experts), 3 fichiers étaient rejetés uniquement à cause
+  d'une colonne à >90% de NaN — dans les trois cas un champ optionnel
+  légitime (`ranking`/`promotionText` d'AYV_OFF, `CO2` de SUZ_OFF pour des
+  véhicules électriques, `label_direct` d'athlon_B2B_2), pas un export
+  cassé. Descendu à `medium`/`low` : un taux de NaN élevé reste une
+  observation purement statistique, sans le contexte métier nécessaire pour
+  savoir si le champ est censé être rempli. `verifier_colonnes_sans_nom` et
+  `verifier_colonnes_dupliquees` restent `high`, eux, car ce sont des signes
+  univoques d'un problème d'export, pas de simples champs creux.
 
 ## `verifier_types_incoherents`
 

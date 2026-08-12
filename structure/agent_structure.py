@@ -99,12 +99,35 @@ def verifier_fichier_vide(nom_fichier: str, df: pd.DataFrame) -> list:
     )]
 
 
+def _est_index_exporte(serie: pd.Series) -> bool:
+    """
+    Vrai si les valeurs non nulles forment une séquence d'entiers consécutifs
+    dans l'ordre (0..n-1 ou 1..n) : signe quasi certain que c'est l'index
+    pandas exporté par erreur (to_csv/to_excel sans index=False), pas un
+    décalage de colonnes à l'export. Découvert en calibrant sur données
+    réelles (`NL_B2C_AYV_OFF.xlsx`, colonne 'Unnamed: 0' = index 0..17170) :
+    voir structure/regles.md.
+    """
+    valeurs = serie.dropna()
+    if len(valeurs) < 2 or not pd.api.types.is_numeric_dtype(valeurs):
+        return False
+    if not (valeurs == valeurs.round()).all():
+        return False  # valeurs non entières : pas un index
+    depart = int(valeurs.iloc[0])
+    return list(valeurs.astype("int64")) == list(range(depart, depart + len(valeurs)))
+
+
 def verifier_colonnes_sans_nom(nom_fichier: str, df: pd.DataFrame) -> list:
     """
     Signale les colonnes sans nom (vide, blanc, ou 'Unnamed: N' généré par pandas
     à la lecture d'un fichier sans en-tête sur cette colonne).
-    Sévérité 'high' si la colonne contient des données, 'low' si elle est
-    entièrement vide (simple artefact d'export sans impact).
+
+    Sévérité 'high' si la colonne contient des données qui ne semblent pas
+    être un index exporté par erreur (probable décalage de colonnes) ; 'low'
+    si elle est entièrement vide, ou si ses valeurs forment une séquence
+    d'entiers consécutifs (_est_index_exporte) — dans les deux cas, un
+    artefact d'export sans impact sur les autres colonnes, pas un signe de
+    décalage.
     """
     anomalies = []
     for i, colonne in enumerate(df.columns):
@@ -121,6 +144,15 @@ def verifier_colonnes_sans_nom(nom_fichier: str, df: pd.DataFrame) -> list:
                 f"La colonne '{colonne}' n'a pas de nom mais ne contient aucune donnée : "
                 "simple artefact d'export, sans impact.",
                 0.6,
+            ))
+        elif _est_index_exporte(serie):
+            anomalies.append(_anomalie(
+                nom_fichier, 0, [colonne], "low",
+                f"{nb_valeurs} valeur(s) formant une séquence d'entiers consécutifs sans nom de colonne",
+                f"La colonne '{colonne}' n'a pas de nom mais ses valeurs forment une séquence "
+                "d'entiers consécutifs : probablement l'index pandas exporté par erreur, "
+                "sans impact sur les autres colonnes.",
+                0.7,
             ))
         else:
             anomalies.append(_anomalie(
@@ -203,9 +235,20 @@ def verifier_lignes_dupliquees(nom_fichier: str, df: pd.DataFrame) -> list:
 
 def verifier_taux_valeurs_manquantes(nom_fichier: str, df: pd.DataFrame) -> list:
     """
-    Signale les colonnes avec un taux de valeurs manquantes élevé (medium >= 50%,
-    high >= 90%). Exclut les colonnes sans nom et les colonnes à 100% de NaN,
+    Signale les colonnes avec un taux de valeurs manquantes élevé (low >= 50%,
+    medium >= 90%). Exclut les colonnes sans nom et les colonnes à 100% de NaN,
     déjà couvertes par les vérifications précédentes.
+
+    Sévérités volontairement non bloquantes (jamais 'high'/'critical'), même
+    au-delà de 90% : découvert en calibrant sur données réelles
+    (`NL_B2C_AYV_OFF.xlsx`, `NL_B2B_SUZ_OFF.xlsx`, `OK_athlon_B2B_2.xlsx`),
+    un taux de NaN élevé correspond très souvent à un champ optionnel
+    légitimement rare (ex. 'promotionText' vide hors promotion, 'CO2' vide
+    pour un véhicule électrique) plutôt qu'à un export cassé — contrairement
+    à `verifier_colonnes_sans_nom` ou `verifier_colonnes_dupliquees`, qui
+    restent 'high' car ce sont, elles, des signes univoques d'un problème
+    d'export. Voir structure/regles.md et judge/regles_judge.md (plafond
+    des sévérités non bloquantes).
     """
     anomalies = []
     nb_lignes = len(df)
@@ -223,10 +266,10 @@ def verifier_taux_valeurs_manquantes(nom_fichier: str, df: pd.DataFrame) -> list
         if taux >= 1.0:
             continue  # colonne entièrement vide, déjà couverte par verifier_colonnes_vides
         elif taux >= SEUIL_NAN_HIGH:
-            severite = "high"
+            severite = "medium"
             libelle_seuil = "plus de 90%"
         elif taux >= SEUIL_NAN_MEDIUM:
-            severite = "medium"
+            severite = "low"
             libelle_seuil = "plus de la moitié"
         else:
             continue

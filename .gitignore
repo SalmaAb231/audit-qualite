@@ -10,6 +10,12 @@ data/cache/
 # Résultats générés
 resultats/
 
+# Cache des réponses LLM et compteur de quota (état d'exécution local)
+cache_llm/
+
+# Logs d'exécution
+*.log
+
 # Fichiers Excel isolés à la racine (au cas où)
 *.xlsx
 
