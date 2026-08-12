@@ -91,16 +91,16 @@ notamment :
 
 Le chef de gare : pour chaque fichier, enchaîne `structure/` → (arrêt si
 `critical`) → `stats/` **et** `agent_coherence` **en parallèle**
-(`ThreadPoolExecutor`, deux canaux indépendants qui lisent chacun tout le
-fichier) → sélection des lignes suspectes (anomalies de structure + stats +
+(`ThreadPoolExecutor`, deux canaux indépendants sur le même fichier déjà
+chargé — Cohérence reçoit directement ce `df` et les anomalies de structure
+déjà calculées, sans recharger le fichier ni revérifier son exploitabilité)
+→ sélection des lignes suspectes (anomalies de structure + stats +
 cohérence, plus un échantillon de contrôle) → `agent_realisme` → `judge/` →
 `reporting/`, avec un garde-fou qui arrête proprement le run si le quota LLM
 quotidien est épuisé (plutôt que de produire des verdicts silencieusement
 faux). Un dossier de résultats séparé par mois d'origine
 (`resultats/LOAD_LOCK_AAAAMM/`) évite toute collision entre deux fichiers de
-même nom dans des mois différents. Détails et décisions de conception (y
-compris les redondances acceptées avec `agent_coherence.py` — double
-chargement du fichier, double garde de structure) dans
+même nom dans des mois différents. Détails et décisions de conception dans
 [`regles_orchestrateur.md`](regles_orchestrateur.md).
 
 ⚠️ Cohérence traite tout le fichier (pas seulement les lignes suspectes) :
@@ -165,7 +165,11 @@ python -m stats.agent_stats <fichier_ou_chemin>
   au-delà de `config.SEUIL_FICHIER_GEANT`), gère son propre checkpoint
   (reprise sans re-consommer de requête, `resultats/coherence/checkpoints/`)
   et sauvegarde son résultat complet dans `resultats/coherence/<fichier>.json`.
-  Appelé par `orchestrateur.py` en parallèle de `stats/`.
+  `analyser_fichier(chemin, df=None, anomalies_structure=None)` : les deux
+  derniers paramètres sont optionnels — fournis par `orchestrateur.py`
+  (appel en parallèle de `stats/`) pour éviter de recharger le fichier et de
+  revérifier son exploitabilité une seconde fois ; absents en usage autonome
+  (charge et vérifie elle-même, comme avant).
 - **`prompts/coherence.md`** : le prompt système de cet agent (fichier
   séparé plutôt qu'une constante Python, pour l'itérer sans toucher au code).
 - **`agent_realisme.py`** : juge si une valeur a un sens dans le **monde

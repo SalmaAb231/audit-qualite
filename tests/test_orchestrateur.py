@@ -158,15 +158,17 @@ def test_pipeline_fichier_flux_complet_integre_les_anomalies_realisme(monkeypatc
     # Une ligne dupliquée (index 2) donne une anomalie structure avec ligne=2 != 0,
     # donc _lignes_suspectes sélectionne bien au moins cette ligne : garantit que
     # analyser_realisme reçoit un lot non vide et appelle le client factice.
-    # Cohérence est bien invoquée (chemin factice de _info() -> son propre
-    # chargement échoue -> [] sans appel réseau, voir AgentCoherence.analyser_fichier).
+    # Cohérence reçoit directement df + anomalies_structure (plus de rechargement,
+    # voir AgentCoherence.analyser_fichier) : elle est bien invoquée, avec un
+    # client factice qui répond "aucune anomalie".
     df = pd.DataFrame({"Modele": ["A", "B", "A", "C", "D"], "Prix": [1, 2, 1, 3, 4]})
 
     reponse = ({"anomalies": [_anomalie_realisme(ligne=2)]}, AppelMetadata(modele="m", succes=True))
     client = _ClientFactice(reponses=[reponse])
+    coherence_client = _ClientFactice(reponses=[({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
 
     verdict = orchestrateur.pipeline_fichier(
-        _info(), df, client=client, coherence_client=_ClientExplosif(), random_state=0
+        _info(), df, client=client, coherence_client=coherence_client, random_state=0
     )
 
     assert len(client.appels) == 1
@@ -178,13 +180,10 @@ def test_pipeline_fichier_flux_complet_integre_les_anomalies_realisme(monkeypatc
 def test_pipeline_fichier_integre_les_anomalies_coherence(monkeypatch):
     # Stats et Cohérence tournent en parallèle sur tout le fichier ; leurs
     # anomalies combinées alimentent _lignes_suspectes et le verdict final.
+    # Aucun mock de LocalLoader.charger nécessaire ici : Cohérence reçoit
+    # directement le df déjà chargé, elle ne recharge plus rien elle-même.
     monkeypatch.setattr(config, "TAUX_ECHANTILLON_CONTROLE", 0.0)
     df = pd.DataFrame({"Modele": ["A", "B", "C", "D", "E"], "Prix": [10, 20, 30, 40, 50]})
-
-    # AgentCoherence charge elle-même le fichier depuis info.chemin : on
-    # redirige LocalLoader.charger (classe partagée avec orchestrateur.py)
-    # pour qu'elle reçoive ce df sans toucher au disque.
-    monkeypatch.setattr(orchestrateur.LocalLoader, "charger", lambda self, chemin: df)
 
     anomalie_coherence = {
         "fichier": NOM_FICHIER_TEST, "ligne": 3, "colonnes": ["Modele", "Prix"], "type": "coherence",
@@ -203,6 +202,27 @@ def test_pipeline_fichier_integre_les_anomalies_coherence(monkeypatch):
     assert len(coherence_client.appels) == 1
     assert verdict["anomalies_par_type"]["coherence"] == 1
     assert any(a["type"] == "coherence" and a["ligne"] == 3 for a in verdict["anomalies"])
+
+
+def test_pipeline_fichier_ne_recharge_pas_le_fichier_pour_coherence(monkeypatch):
+    # Preuve directe de la correction : si Cohérence essayait de recharger
+    # le fichier depuis le disque (comme avant), ceci lèverait.
+    def _charger_qui_explose(self, chemin):
+        raise AssertionError("Cohérence n'aurait pas dû recharger le fichier depuis le disque")
+
+    monkeypatch.setattr(orchestrateur.LocalLoader, "charger", _charger_qui_explose)
+    monkeypatch.setattr(config, "TAUX_ECHANTILLON_CONTROLE", 0.0)
+
+    df = pd.DataFrame({"Modele": ["A", "B", "C"], "Prix": [10, 20, 30]})
+    coherence_client = _ClientFactice(reponses=[({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
+    realisme_client = _ClientFactice(reponses=[])  # aucune ligne suspecte attendue -> jamais appelé
+
+    verdict = orchestrateur.pipeline_fichier(
+        _info(), df, client=realisme_client, coherence_client=coherence_client, random_state=0
+    )
+
+    assert verdict["verdict"] in {"ACCEPTED", "WARNING", "REJECTED"}
+    assert len(coherence_client.appels) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -236,8 +256,8 @@ def test_main_traite_un_fichier_et_ecrit_les_resultats(monkeypatch, tmp_path):
     monkeypatch.setattr(orchestrateur.LocalLoader, "lister_fichiers", lambda self: [info])
     monkeypatch.setattr(orchestrateur.LocalLoader, "charger", lambda self, chemin: df)
 
-    # AgentCoherence charge aussi via LocalLoader.charger (mocké ci-dessus) :
-    # son chargement réussit donc ici, elle atteint bien l'appel LLM.
+    # Ce mock de charger() sert à main() (qui charge le fichier une fois) ;
+    # Cohérence reçoit ensuite ce même df directement, sans recharger.
     coherence_client = _ClientFactice(reponses=[({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
 
     verdicts = orchestrateur.main(client=_ClientFactice(reponses=[]), coherence_client=coherence_client)

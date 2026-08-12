@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas as pd
 from loguru import logger
 
 import config
@@ -217,28 +218,43 @@ class AgentCoherence:
         self.llm_client = llm_client or LLMClient()
         self.prompt_systeme = _charger_prompt_systeme()
 
-    def analyser_fichier(self, chemin) -> dict:
+    def analyser_fichier(self, chemin, df: pd.DataFrame | None = None, anomalies_structure: list | None = None) -> dict:
         """
         Analyse un fichier : garde d'entrée (structure), puis chunks envoyés
         au LLM. Retourne le résultat agrégé et le sauvegarde dans
         resultats/coherence/<fichier>.json. Ne lève jamais d'exception :
         un échec de chargement est traité comme un rejet.
+
+        `df` et `anomalies_structure` sont optionnels, pour un appelant qui
+        a déjà chargé le fichier et déjà vérifié son exploitabilité (ex.
+        orchestrateur.py, qui appelle stats/ et Cohérence en parallèle sur
+        le même df déjà validé) : évite de recharger le fichier depuis le
+        disque et de recalculer le garde de structure une seconde fois.
+        Précondition si fournis : l'appelant a déjà vérifié
+        `structure.agent_structure.fichier_exploitable(anomalies_structure)
+        is True` — ce module ne revérifie pas dans ce cas. En usage
+        autonome (aucun des deux fourni, ex. tests, script direct), le
+        fichier est chargé et vérifié ici comme avant.
         """
         chemin = Path(chemin)
         nom_fichier = chemin.name
 
-        df_brut = LocalLoader().charger(chemin)
-        if df_brut is None:
-            resultat = self._resultat_rejet(nom_fichier, "Échec du chargement du fichier (voir logs).", 0)
-            _sauvegarder_resultat(nom_fichier, resultat)
-            return resultat
+        if df is None:
+            df_brut = LocalLoader().charger(chemin)
+            if df_brut is None:
+                resultat = self._resultat_rejet(nom_fichier, "Échec du chargement du fichier (voir logs).", 0)
+                _sauvegarder_resultat(nom_fichier, resultat)
+                return resultat
+        else:
+            df_brut = df
 
-        exploitable, motif_rejet, anomalies_structure = _verifier_exploitabilite(nom_fichier, df_brut)
-        if not exploitable:
-            logger.warning(f"{nom_fichier} jugé inexploitable par le détecteur de structure : {motif_rejet}")
-            resultat = self._resultat_rejet(nom_fichier, motif_rejet, len(df_brut), anomalies_structure)
-            _sauvegarder_resultat(nom_fichier, resultat)
-            return resultat
+        if anomalies_structure is None:
+            exploitable, motif_rejet, anomalies_structure = _verifier_exploitabilite(nom_fichier, df_brut)
+            if not exploitable:
+                logger.warning(f"{nom_fichier} jugé inexploitable par le détecteur de structure : {motif_rejet}")
+                resultat = self._resultat_rejet(nom_fichier, motif_rejet, len(df_brut), anomalies_structure)
+                _sauvegarder_resultat(nom_fichier, resultat)
+                return resultat
 
         nb_lignes_totales = len(df_brut)
         if nb_lignes_totales > config.SEUIL_FICHIER_GEANT:

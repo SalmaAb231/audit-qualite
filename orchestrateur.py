@@ -3,13 +3,13 @@ Orchestrateur du pipeline audit-qualite.
 
 Le chef de gare : pour chaque fichier, enchaîne structure/ (portier, arrête
 tout appel LLM si critical) -> stats/ ET Cohérence EN PARALLÈLE (chacun lit
-tout le fichier, canaux indépendants) -> Réalisme (lignes suspectes
-pointées par structure/stats/Cohérence + un échantillon aléatoire de
-contrôle, voir _lignes_suspectes ; connaissances internes du modèle
-uniquement, PAS de recherche web — voir « Limite : pas de recherche web »
-plus bas) -> judge/ (verdict) -> reporting/ (rapport HTML par fichier), puis
-un rapport consolidé sur l'ensemble des fichiers traités dans cette
-exécution.
+tout le fichier ; Cohérence reçoit le df et les anomalies de structure déjà
+calculés par ce module, pas de rechargement ni de double garde d'entrée) ->
+Réalisme (lignes suspectes pointées par structure/stats/Cohérence + un
+échantillon aléatoire de contrôle, voir _lignes_suspectes ; vérifie ses
+anomalies candidates par recherche web, voir agents/regles_realisme.md) ->
+judge/ (verdict) -> reporting/ (rapport HTML par fichier), puis un rapport
+consolidé sur l'ensemble des fichiers traités dans cette exécution.
 
 Voir regles_orchestrateur.md pour les décisions de conception (sélection
 des lignes suspectes, garde-fou de quota, un dossier de résultats par mois,
@@ -87,18 +87,20 @@ def _lignes_suspectes(df: pd.DataFrame, anomalies: list, random_state=None) -> p
 # ---------------------------------------------------------------------------
 
 
-def _analyser_coherence(info, llm_client=None) -> list:
+def _analyser_coherence(info, df: pd.DataFrame, anomalies_structure: list, llm_client=None) -> list:
     """
     Lance l'agent Cohérence (agents/agent_coherence.py) sur le fichier
-    complet et retourne ses anomalies. Canal indépendant de stats/ : elle
-    recharge elle-même le fichier depuis le disque (ne partage pas le df
-    déjà chargé par l'orchestrateur) et ré-exécute son propre garde d'entrée
-    structure/ — redondant avec celui de pipeline_fichier(), sans incidence
-    sur le résultat (structure/ est déterministe et rapide), voir
-    regles_orchestrateur.md. Gère elle-même son checkpoint et sauvegarde
-    son résultat complet dans resultats/coherence/<fichier>.json.
+    complet et retourne ses anomalies. Canal indépendant de stats/, mais lui
+    transmet le df déjà chargé et les anomalies de structure déjà calculées
+    par pipeline_fichier() : elle ne recharge plus le fichier depuis le
+    disque ni ne revérifie son exploitabilité une seconde fois (voir la
+    docstring de AgentCoherence.analyser_fichier). Gère elle-même son
+    checkpoint et sauvegarde son résultat complet dans
+    resultats/coherence/<fichier>.json.
     """
-    resultat = AgentCoherence(llm_client=llm_client).analyser_fichier(info.chemin)
+    resultat = AgentCoherence(llm_client=llm_client).analyser_fichier(
+        info.chemin, df=df, anomalies_structure=anomalies_structure
+    )
     return resultat.get("anomalies", [])
 
 
@@ -135,7 +137,7 @@ def pipeline_fichier(info, df: pd.DataFrame, client=None, coherence_client=None,
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futur_stats = executor.submit(analyser_stats, nom_fichier, df)
-        futur_coherence = executor.submit(_analyser_coherence, info, coherence_client)
+        futur_coherence = executor.submit(_analyser_coherence, info, df, anomalies_structure, coherence_client)
         anomalies_stats = futur_stats.result()
         anomalies_coherence = futur_coherence.result()
     logger.info(f"  Stats : {len(anomalies_stats)} anomalie(s)")

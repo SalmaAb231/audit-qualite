@@ -85,21 +85,18 @@ plusieurs minutes (plusieurs appels LLM en chunks) — les lancer en parallèle
 concurrence entre eux (Stats ne touche jamais le compteur de quota LLM ni le
 cache réseau, seul Cohérence le fait).
 
-**Deux redondances acceptées, plutôt que de modifier le code de Cohérence** :
-- `AgentCoherence.analyser_fichier(chemin)` recharge elle-même le fichier
-  depuis le disque (`ingestion.local_loader.LocalLoader`), au lieu de
-  réutiliser le `df` déjà chargé par l'orchestrateur — double lecture du
-  même fichier, notable sur les plus gros fichiers du projet (plusieurs
-  centaines de milliers de lignes).
-- Elle exécute aussi son propre garde d'entrée `structure/` en interne
-  (`_verifier_exploitabilite`), redondant avec celui déjà fait par
-  `pipeline_fichier()` juste avant. Sans incidence sur le résultat
-  (`structure/` est déterministe et rapide), juste un calcul en double.
-
-Les deux sont volontairement non corrigées ici : refactorer
-`agents/agent_coherence.py` pour accepter un `df` déjà chargé est un
-changement du code d'un autre binôme, à faire avec elle plutôt qu'en
-solo dans l'orchestrateur.
+**Deux redondances corrigées** : `AgentCoherence.analyser_fichier()`
+rechargeait elle-même le fichier depuis le disque et ré-exécutait son propre
+garde d'entrée `structure/`, en double avec ce que `pipeline_fichier()`
+avait déjà fait juste avant — notable sur les plus gros fichiers du projet
+(plusieurs centaines de milliers de lignes). Corrigé en ajoutant deux
+paramètres optionnels à `analyser_fichier(chemin, df=None,
+anomalies_structure=None)` : s'ils sont fournis (cas de l'orchestrateur),
+aucun rechargement ni double garde ; s'ils sont absents (usage autonome,
+ex. `agents/test_coherence.py`), comportement inchangé. Modification faite
+dans `agents/agent_coherence.py` (fichier de Salma) à la demande de Hanane —
+à lui signaler, elle n'était pas au courant que l'orchestrateur l'appelle
+désormais automatiquement. Voir la docstring de `analyser_fichier`.
 
 **Coût en requêtes, à surveiller** : contrairement à Réalisme (limité aux
 lignes suspectes), Cohérence traite tout le fichier en chunks
@@ -120,14 +117,13 @@ qu'avant l'ajout de Cohérence.
   deviennent pas des lignes suspectes via ce mécanisme, seulement via
   l'échantillon aléatoire (probabilité, pas garantie).
 
-## Pas de recherche web pour Réalisme
+## Vérification web de Réalisme
 
-Réalisme juge la plausibilité des valeurs avec les seules connaissances
-internes du modèle — aucun appel à un moteur de recherche. Nécessiterait un
-service de recherche externe (clé API à choisir et obtenir) et une
-implémentation d'appel d'outils dans `agents/llm_client.py` (socle partagé
-avec Cohérence) : décision volontairement mise en attente, voir
-`agents/regles_realisme.md` ("Limite connue : pas de recherche web").
+Réalisme vérifie désormais ses anomalies candidates par une recherche web
+(bibliothèque `ddgs`, gratuite, sans clé API) avant de les retenir
+définitivement — pas du tool-calling agentique (peu fiable sur les modèles
+`:free`), un second passage fixe après le jugement initial. Détails complets
+dans `agents/regles_realisme.md` ("Vérification web (pas de tool calling)").
 
 ## Garde-fou de quota
 
