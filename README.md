@@ -17,11 +17,13 @@ Fichier (Excel/CSV)
 1. structure/     — la forme du fichier est-elle valide ? (colonnes, doublons, types)
       │  si anomalie "critical" → arrêt, verdict REJECTED direct, aucun coût LLM
       ▼
-2. stats/          — les valeurs sont-elles statistiquement plausibles ? (IQR, corrélations)
-      │  tourne sur TOUT le fichier, 100% mathématique, aucun LLM
+2. stats/  ET  agents/agent_coherence.py   — EN PARALLÈLE (deux canaux indépendants)
+      │  stats/ : valeurs statistiquement plausibles ? (IQR, corrélations) — tout le fichier, 100% mathématique
+      │  Cohérence : contradiction logique entre colonnes d'une même ligne ? — tout le fichier, LLM
       ▼
 3. agents/agent_realisme.py — les valeurs ont-elles un sens dans le monde réel automobile ?
-      │  LLM, mais UNIQUEMENT sur les lignes suspectes (repérées par 1-2) + échantillon de contrôle
+      │  LLM, UNIQUEMENT sur les lignes suspectes (repérées par 1-2) + échantillon de contrôle,
+      │  puis vérification par recherche web (ddgs, gratuit) des anomalies candidates
       ▼
 4. judge/          — agrège toutes les anomalies (peu importe qui les a trouvées) → score, grade, verdict
       ▼
@@ -29,11 +31,6 @@ Fichier (Excel/CSV)
       ▲
       └── orchestrateur.py fait circuler chaque fichier à travers ces 5 étapes
 ```
-
-**Agent Cohérence** (incohérence logique entre plusieurs champs d'une même
-ligne, ex. date de fin avant date de début) : prévu dans l'architecture,
-**pas encore implémenté** dans ce dépôt (en cours de développement en
-parallèle). L'orchestrateur tourne sans lui pour l'instant.
 
 ## Choix de conception : schema-agnostic
 
@@ -93,13 +90,23 @@ notamment :
 ### `orchestrateur.py` (racine)
 
 Le chef de gare : pour chaque fichier, enchaîne `structure/` → (arrêt si
-`critical`) → `stats/` → sélection des lignes suspectes → `agent_realisme` →
-`judge/` → `reporting/`, avec un garde-fou qui arrête proprement le run si
-le quota LLM quotidien est épuisé (plutôt que de produire des verdicts
-silencieusement faux). Un dossier de résultats séparé par mois d'origine
+`critical`) → `stats/` **et** `agent_coherence` **en parallèle**
+(`ThreadPoolExecutor`, deux canaux indépendants qui lisent chacun tout le
+fichier) → sélection des lignes suspectes (anomalies de structure + stats +
+cohérence, plus un échantillon de contrôle) → `agent_realisme` → `judge/` →
+`reporting/`, avec un garde-fou qui arrête proprement le run si le quota LLM
+quotidien est épuisé (plutôt que de produire des verdicts silencieusement
+faux). Un dossier de résultats séparé par mois d'origine
 (`resultats/LOAD_LOCK_AAAAMM/`) évite toute collision entre deux fichiers de
-même nom dans des mois différents. Détails et décisions de conception dans
+même nom dans des mois différents. Détails et décisions de conception (y
+compris les redondances acceptées avec `agent_coherence.py` — double
+chargement du fichier, double garde de structure) dans
 [`regles_orchestrateur.md`](regles_orchestrateur.md).
+
+⚠️ Cohérence traite tout le fichier (pas seulement les lignes suspectes) :
+elle coûte beaucoup plus de requêtes LLM que Réalisme. Sur un run
+multi-fichiers, le quota gratuit (45/jour) peut s'épuiser sur un seul gros
+fichier — voir « Contraintes importantes » plus bas.
 
 ```powershell
 python -m orchestrateur                          # tous les fichiers de DATA_DIR
@@ -141,10 +148,10 @@ python -m structure.agent_structure <fichier_ou_chemin>
 python -m stats.agent_stats <fichier_ou_chemin>
 ```
 
-### `agents/` — socle LLM commun + agent Réalisme
+### `agents/` — socle LLM commun + agents Cohérence et Réalisme
 
 - **`llm_client.py`** : client HTTP pour l'API OpenRouter, partagé par tous
-  les agents LLM (Réalisme, et à terme Cohérence/Judge/Reporting). Gère la
+  les agents LLM (Cohérence, Réalisme, à terme Judge/Reporting). Gère la
   cascade de modèles (`config.MODELES`), les retries progressifs, le cache
   disque des réponses (`cache_llm/`, pour ne jamais repayer une requête
   identique) et le respect strict du quota gratuit quotidien
@@ -152,6 +159,15 @@ python -m stats.agent_stats <fichier_ou_chemin>
 - **`parse_utils.py`** : extraction robuste de JSON depuis une réponse LLM
   (qui peut être mal formée, tronquée, entourée de texte) et validation de
   chaque anomalie contre le contrat commun.
+- **`agent_coherence.py`** : détecte les contradictions logiques **entre
+  colonnes d'une même ligne** (ex. motorisation électrique avec une
+  consommation en L/100km). Lit tout le fichier (échantillonné seulement
+  au-delà de `config.SEUIL_FICHIER_GEANT`), gère son propre checkpoint
+  (reprise sans re-consommer de requête, `resultats/coherence/checkpoints/`)
+  et sauvegarde son résultat complet dans `resultats/coherence/<fichier>.json`.
+  Appelé par `orchestrateur.py` en parallèle de `stats/`.
+- **`prompts/coherence.md`** : le prompt système de cet agent (fichier
+  séparé plutôt qu'une constante Python, pour l'itérer sans toucher au code).
 - **`agent_realisme.py`** : juge si une valeur a un sens dans le **monde
   réel automobile** (une marque/modèle/puissance/prix qui existe vraiment),
   par opposition à Cohérence (contradiction logique entre colonnes) ou
@@ -159,11 +175,21 @@ python -m stats.agent_stats <fichier_ou_chemin>
   chunks (`config.CHUNK_SIZE`), injecte la date du jour dans le prompt
   (sans ça, le modèle ne sait pas si une date est dans le futur ou le
   passé). Ne décide jamais lui-même quelles lignes analyser : c'est
-  `orchestrateur.py` qui lui fournit un sous-ensemble de lignes.
-- **`regles_realisme.md`** : frontière avec Cohérence, limites connues
-  (pas de recherche web, dépendance à la qualité du modèle gratuit du jour).
+  `orchestrateur.py` qui lui fournit un sous-ensemble de lignes. Vérifie
+  ensuite ses propres anomalies candidates par une **recherche web**
+  (bibliothèque `ddgs`, DuckDuckGo, gratuite, sans clé API) : un seul appel
+  LLM de vérification par chunk (pas par anomalie), qui confirme ou retire
+  une anomalie selon des résultats de recherche récents — pilotable via
+  `config.RECHERCHE_WEB_ACTIVEE`.
+- **`regles_realisme.md`** : frontière avec Cohérence, mécanisme de
+  vérification web en détail, limites connues.
 - **`test_premier_appel.py`** : script de preuve du socle LLM sur un
-  fichier réel (historique, antérieur à `agent_realisme.py`).
+  fichier réel (historique, antérieur aux agents complets).
+- **`test_coherence.py`**, **`test_coherence_injection.py`** : tests dédiés
+  à l'agent Cohérence (calibration, injection d'anomalies synthétiques).
+
+`agent_coherence.py` n'a pas de CLI : s'utilise via
+`AgentCoherence().analyser_fichier(chemin)` (voir `test_coherence.py`).
 
 ```powershell
 python -m agents.agent_realisme <fichier_ou_chemin>
@@ -226,14 +252,31 @@ python -m ingestion.test_s3_connexion
 - **`contrat_anomalie.md`** : le format JSON commun décrit plus haut, avec
   le détail des énumérations et l'usage du score de confiance.
 
+### `jeu_validation/`
+
+Jeux de données de validation, avec vérité terrain, pour calibrer les
+agents LLM sans dépendre uniquement du jugement humain au cas par cas.
+- **`coherence/`** : fichiers de vérité terrain (`*_verite_terrain.json`)
+  pour l'agent Cohérence, et les scripts qui les génèrent
+  (`generer_fichier_teste.py`, `generer_fichier_teste_2.py` — injectent des
+  incohérences synthétiques dans un extrait de fichier réel, pour mesurer
+  le rappel de l'agent sur des cas connus).
+
 ### `tests/`
 
 Un fichier de test par module (`test_structure.py`, `test_stats.py`,
 `test_agent_realisme.py`, `test_agent_judge.py`, `test_agent_reporting.py`,
 `test_orchestrateur.py`), plus des tests de conformité au contrat commun.
+Les tests de l'agent Cohérence vivent à côté de son code
+(`agents/test_coherence.py`, `agents/test_coherence_injection.py`), pas ici.
+
 Aucun test ne fait d'appel réseau réel : les tests LLM utilisent un client
 factice (voir `_ClientFactice` dans `test_agent_realisme.py` et
 `test_orchestrateur.py`) pour ne jamais consommer le quota gratuit partagé.
+Deux fixtures `autouse` protègent spécifiquement contre les fuites
+accidentelles : `config.RECHERCHE_WEB_ACTIVEE` désactivée par défaut (sinon
+un vrai appel réseau `ddgs`), et les dossiers de résultats/checkpoints de
+Cohérence redirigés vers `tmp_path`.
 
 ```powershell
 python -m pytest tests/ -v
@@ -289,10 +332,15 @@ python -m pytest tests/ -v
 
 ## Contraintes importantes à connaître avant de lancer un run réel
 
-- **Quota LLM partagé** : `config.RATE_LIMIT["max_requetes_jour"] = 45`,
-  partagé par tout le projet (Réalisme, et à terme Cohérence/Judge). Un
-  appel LLM peut prendre de 30 secondes à plusieurs minutes sur le tier
-  gratuit. `agents.llm_client.quota_restant()` donne le solde du jour ;
+- **Quota LLM partagé, désormais beaucoup plus tendu** :
+  `config.RATE_LIMIT["max_requetes_jour"] = 45`, partagé par tout le projet
+  (Cohérence, Réalisme, Judge). Un appel LLM peut prendre de 30 secondes à
+  plusieurs minutes sur le tier gratuit. Depuis l'ajout de Cohérence (traite
+  tout le fichier, pas juste les lignes suspectes) et de la vérification web
+  de Réalisme (un appel de plus par chunk), **un seul gros fichier peut
+  épuiser le quota du jour à lui seul** — envisager l'achat unique de 10$
+  sur OpenRouter (45 → 1000 requêtes/jour) si des runs plus larges sont
+  nécessaires. `agents.llm_client.quota_restant()` donne le solde du jour ;
   `orchestrateur.main()` s'arrête proprement quand il atteint 0.
 - **Fichiers de même nom dans des mois différents** : plusieurs fichiers
   `data/LOAD_LOCK_*/` portent le même nom (ex. `NL_B2B_BRO_OFF.xlsx` existe
@@ -301,6 +349,9 @@ python -m pytest tests/ -v
   module individuellement (`python -m structure.agent_structure <nom>`),
   la résolution par nom seul renvoie systématiquement la **première**
   copie trouvée : donnez un chemin complet si vous visez une copie précise.
+- **`ddgs` (recherche web de Réalisme) n'a pas d'API officielle** : peut se
+  dégrader ou se bloquer sans préavis. Désactivable sans toucher au code via
+  `config.RECHERCHE_WEB_ACTIVEE = False`.
 
 ## État actuel du pipeline
 
@@ -308,9 +359,9 @@ python -m pytest tests/ -v
 |---|---|
 | Structure | ✅ Implémenté, testé, calibré sur données réelles |
 | Stats | ✅ Implémenté, testé, calibré sur données réelles |
-| Cohérence | ❌ Pas encore dans ce dépôt (en cours côté binôme) |
-| Réalisme | ✅ Implémenté, testé, calibré |
+| Cohérence | ✅ Implémenté, branché dans l'orchestrateur (en parallèle de Stats) |
+| Réalisme | ✅ Implémenté, testé, calibré, avec vérification web |
 | Judge | ✅ Implémenté, testé, calibré |
 | Reporting | ✅ Implémenté (HTML), testé |
-| Orchestrateur | ✅ Implémenté, testé — tourne sans Cohérence pour l'instant |
+| Orchestrateur | ✅ Implémenté, testé — pipeline complet de bout en bout |
 | Dépôt S3 des rapports (`config.S3_REPORTS_PREFIX`) | ❌ Pas encore implémenté |
