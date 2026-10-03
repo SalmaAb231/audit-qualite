@@ -10,7 +10,7 @@ des fichiers traités. Ne détecte ni ne recalcule rien : pure mise en forme,
 Convention pour generer_rapport_consolide() : chaque dict de fichiers_verdicts
 est un verdict de judge.agent_judge.analyser(), avec deux clés optionnelles
 que l'appelant (l'orchestrateur, à terme) peut ajouter :
-- "anomalies" (list[dict]) : anomalies brutes de ce fichier, utilisées pour
+- "anomalies" (list[dict]) : problèmes de ce fichier, utilisés pour
   le "top anomalies les plus fréquentes". Absente -> ce fichier ne contribue
   pas au calcul (pas d'erreur, juste moins de détail).
 - "dossier_mois" (str, ex. "LOAD_LOCK_202603") : utilisée pour "Évolution par
@@ -114,6 +114,46 @@ def _trier_par_severite(anomalies: list) -> list:
     return sorted(anomalies, key=lambda a: ORDRE_SEVERITE.get(a.get("severite"), 99))
 
 
+def _sources(anomalie: dict) -> list:
+    sources = anomalie.get("sources") or [anomalie.get("type") or anomalie.get("source") or "inconnue"]
+    if isinstance(sources, str):
+        sources = [sources]
+    return sorted(set(str(s) for s in sources))
+
+
+def _problemes(verdict: dict) -> list:
+    return verdict.get("anomalies_consolidees", verdict.get("anomalies")) or []
+
+
+def _nb_problemes(verdict: dict, anomalies: list | None = None):
+    return verdict.get("nb_problemes_consolides", verdict.get("nb_anomalies_total", len(_problemes(verdict) if anomalies is None else anomalies)))
+
+
+def _signalements_bruts(verdict: dict):
+    """La provenance originale seule permet de répartir un problème multi-agents."""
+    if "anomalies_consolidees" not in verdict and "anomalies" not in verdict:
+        return None
+    signalements = []
+    for a in _problemes(verdict):
+        originaux = a.get("signalements_originaux")
+        if originaux:
+            signalements.extend(originaux)
+        elif a.get("nb_signalements", 1) == 1 and len(_sources(a)) == 1:
+            signalements.append(a)
+        else:
+            return None
+    return signalements
+
+
+def _nb_bruts(verdict: dict):
+    if "nb_signalements_bruts" in verdict:
+        return verdict["nb_signalements_bruts"]
+    if "anomalies_total_brutes" in verdict:
+        return verdict["anomalies_total_brutes"]
+    bruts = _signalements_bruts(verdict)
+    return len(bruts) if bruts is not None else "-"
+
+
 def _ligne_tableau_anomalie(anomalie: dict) -> str:
     severite = anomalie.get("severite") or ""
     colonnes = ", ".join(anomalie.get("colonnes") or []) or "-"
@@ -122,6 +162,8 @@ def _ligne_tableau_anomalie(anomalie: dict) -> str:
         f"<td>{html.escape(str(anomalie.get('ligne', '-')))}</td>"
         f"<td>{html.escape(colonnes)}</td>"
         f"<td>{html.escape(anomalie.get('type') or '')}</td>"
+        f"<td>{html.escape(', '.join(_sources(anomalie)))}</td>"
+        f"<td>{html.escape(str(anomalie.get('nb_signalements', 1)))}</td>"
         f"<td>{html.escape(severite)}</td>"
         f"<td>{html.escape(str(anomalie.get('valeur', '')))}</td>"
         f"<td>{html.escape(anomalie.get('justification') or '')}</td>"
@@ -135,7 +177,8 @@ def _tableau_anomalies(anomalies: list) -> str:
         return '<p class="muted">Aucune anomalie détectée.</p>'
     lignes = "".join(_ligne_tableau_anomalie(a) for a in _trier_par_severite(anomalies))
     return (
-        "<table><thead><tr><th>Ligne</th><th>Colonne(s)</th><th>Type</th>"
+        "<table><thead><tr><th>Ligne</th><th>Colonne(s)</th><th>Type principal</th>"
+        "<th>Sources</th><th>Signalements</th>"
         "<th>Sévérité</th><th>Valeur</th><th>Justification</th><th>Confiance</th>"
         f"</tr></thead><tbody>{lignes}</tbody></table>"
     )
@@ -164,10 +207,13 @@ def generer_rapport_fichier(verdict: dict, anomalies: list) -> str:
             "Score /100" if verdict.get("score_echelle") == 100 else "Score",
         )
         + _carte_resume(verdict.get("grade") if verdict.get("grade") is not None else "-", "Grade")
-        + _carte_resume(verdict.get("nb_anomalies_total", len(anomalies)), "Anomalies")
+        + _carte_resume(_nb_bruts(verdict), "Signalements bruts")
+        + _carte_resume(_nb_problemes(verdict, anomalies), "Problèmes consolidés")
+        + _carte_resume(verdict.get("lignes_affectees", "-"), "Lignes affectées")
         + "</div>"
         f"<p>{html.escape(verdict.get('justification') or '')}</p>"
-        "<h2>Détail des anomalies</h2>"
+        + (f"<p>Couverture estimée : {'oui' if verdict['couverture_estimee'] else 'non'}.</p>" if "couverture_estimee" in verdict else "")
+        + "<h2>Détail des problèmes consolidés</h2>"
         + _tableau_anomalies(anomalies)
     )
     return _page_html(f"Rapport — {fichier}", corps)
@@ -238,6 +284,42 @@ def _section_repartition(titre: str, compteur: dict) -> str:
     return f'<h2>{html.escape(titre)}</h2><div class="summary-grid">{cartes}</div>'
 
 
+def _section_signalements_bruts(fichiers_verdicts: list) -> str:
+    compteur = Counter(dict.fromkeys(config.TYPES_ANOMALIE, 0))
+    manquants = []
+    for fv in fichiers_verdicts:
+        bruts = _signalements_bruts(fv)
+        if bruts is None:
+            manquants.append(fv)
+            continue
+        for a in bruts:
+            agent = a.get("type") or "inconnu"
+            agent = {"stats": "statistique", "realism": "realisme"}.get(agent, agent)
+            compteur[agent] += 1
+    if manquants:
+        # Ne présente jamais les types principaux comme des signalements bruts.
+        return (
+            '<h2>Signalements bruts par agent</h2><p class="muted">'
+            'Répartition complète indisponible : signalements originaux non fournis.</p>'
+            + _section_repartition(
+                "Type principal des problèmes consolidés",
+                _sommer_compteurs(fichiers_verdicts, "anomalies_par_type", config.TYPES_ANOMALIE),
+            )
+        )
+    return _section_repartition("Signalements bruts par agent", dict(compteur)) + _carte_resume(sum(compteur.values()), "Total des signalements bruts")
+
+
+def _section_problemes(fichiers_verdicts: list) -> str:
+    details_disponibles = all("anomalies_consolidees" in fv or "anomalies" in fv for fv in fichiers_verdicts)
+    multi = sum(len(_sources(a)) > 1 for fv in fichiers_verdicts for a in _problemes(fv)) if details_disponibles else "-"
+    return (
+        '<h2>Problèmes consolidés</h2><div class="summary-grid">'
+        + _carte_resume(sum(_nb_problemes(fv) for fv in fichiers_verdicts), "Total des problèmes consolidés")
+        + _carte_resume(multi, "Problèmes confirmés par plusieurs agents")
+        + '</div>'
+    )
+
+
 def _section_top_anomalies(fichiers_verdicts: list) -> str:
     top = _top_anomalies_frequentes(fichiers_verdicts)
     if not top:
@@ -252,7 +334,7 @@ def _section_top_anomalies(fichiers_verdicts: list) -> str:
     )
     return (
         "<h2>Top anomalies les plus fréquentes</h2>"
-        "<table><thead><tr><th>Type</th><th>Colonne(s)</th><th>Justification</th><th>Occurrences</th></tr></thead>"
+        "<table><thead><tr><th>Type principal</th><th>Colonne(s)</th><th>Justification</th><th>Occurrences</th></tr></thead>"
         f"<tbody>{lignes}</tbody></table>"
     )
 
@@ -290,12 +372,15 @@ def _section_fichiers(fichiers_verdicts: list) -> str:
         f"<td>{_badge('Analyse incomplète', 'INCOMPLETE') if fv.get('pipeline_status') == 'INCOMPLETE' else _badge(fv.get('verdict') or '', fv.get('verdict') or '')}</td>"
         f"<td>{html.escape(str(fv.get('grade') if fv.get('grade') is not None else '-'))}</td>"
         f"<td>{html.escape(str(fv.get('score') if fv.get('score') is not None else '-'))}</td>"
-        f"<td>{html.escape(str(fv.get('nb_anomalies_total', '-')))}</td></tr>"
+        f"<td>{html.escape(str(_nb_bruts(fv)))}</td>"
+        f"<td>{html.escape(str(_nb_problemes(fv)))}</td>"
+        f"<td>{html.escape(str(fv.get('lignes_affectees', '-')))}</td></tr>"
         for fv in tries
     )
     return (
         "<h2>Détail par fichier (du plus problématique au meilleur)</h2>"
-        "<table><thead><tr><th>Fichier</th><th>Verdict</th><th>Grade</th><th>Score</th><th>Anomalies</th></tr></thead>"
+        "<table><thead><tr><th>Fichier</th><th>Verdict</th><th>Grade</th><th>Score</th>"
+        "<th>Signalements bruts</th><th>Problèmes consolidés</th><th>Lignes affectées</th></tr></thead>"
         f"<tbody>{lignes}</tbody></table>"
     )
 
@@ -303,7 +388,7 @@ def _section_fichiers(fichiers_verdicts: list) -> str:
 def generer_rapport_consolide(fichiers_verdicts: list) -> str:
     """
     Rapport HTML consolidé sur l'ensemble des fichiers traités : répartition
-    des verdicts, anomalies par type et par sévérité (sommées sur tous les
+    des verdicts, signalements bruts par agent et problèmes consolidés par sévérité (sommés sur tous les
     fichiers), top anomalies les plus fréquentes et évolution par mois (les
     deux seulement "si dispo", voir docstring du module), et tableau de tous
     les fichiers triés du plus problématique au meilleur.
@@ -312,12 +397,10 @@ def generer_rapport_consolide(fichiers_verdicts: list) -> str:
     corps = (
         "<h1>Rapport consolidé — audit qualité</h1>"
         + _section_repartition_verdicts(fichiers_verdicts)
+        + _section_signalements_bruts(fichiers_verdicts)
+        + _section_problemes(fichiers_verdicts)
         + _section_repartition(
-            "Anomalies par type",
-            _sommer_compteurs(fichiers_verdicts, "anomalies_par_type", config.TYPES_ANOMALIE),
-        )
-        + _section_repartition(
-            "Anomalies par sévérité",
+            "Problèmes consolidés par sévérité",
             _sommer_compteurs(fichiers_verdicts, "anomalies_par_severite", tuple(config.PONDERATION_SEVERITE.keys())),
         )
         + _section_top_anomalies(fichiers_verdicts)

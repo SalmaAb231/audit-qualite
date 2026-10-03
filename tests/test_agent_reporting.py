@@ -9,6 +9,8 @@ Usage :
     python -m pytest tests/test_agent_reporting.py -v
 """
 
+from copy import deepcopy
+
 from reporting.agent_reporting import generer_rapport_consolide, generer_rapport_fichier
 
 NOM_FICHIER_TEST = "test.xlsx"
@@ -217,3 +219,85 @@ def test_generer_rapport_consolide_accepte_un_pipeline_incomplet():
     assert "Analyse incomplète" in rapport
     assert "incomplet.xlsx" in rapport
     assert "complet.xlsx" in rapport
+
+
+def _verdict_multiagents():
+    originaux = [_anomalie(type_="coherence"), _anomalie(type_="realisme")]
+    probleme = {**originaux[1], "sources": ["coherence", "realisme"],
+                "nb_signalements": 2, "signalements_originaux": originaux}
+    return _verdict(score=73.4474, grade="C", verdict="WARNING", score_echelle=100,
+                    nb_signalements_bruts=2, nb_problemes_consolides=1,
+                    nb_anomalies_total=1, lignes_affectees=1, couverture_estimee=True,
+                    anomalies_consolidees=[probleme], anomalies_par_type={"realisme": 1})
+
+
+def _carte(valeur, libelle):
+    return f'<div class="valeur">{valeur}</div><div class="libelle">{libelle}</div>'
+
+
+def test_resume_et_tableau_preservent_provenance_multiagents():
+    v = _verdict_multiagents()
+    avant = deepcopy(v)
+    rapport = generer_rapport_fichier(v, [])
+    for valeur, libelle in [(2, "Signalements bruts"), (1, "Problèmes consolidés"),
+                            (1, "Lignes affectées"), (73.4474, "Score /100")]:
+        assert _carte(valeur, libelle) in rapport
+    assert '<th>Type principal</th><th>Sources</th><th>Signalements</th>' in rapport
+    assert '<td>realisme</td><td>coherence, realisme</td><td>2</td>' in rapport
+    assert 'Couverture estimée : oui.' in rapport
+    assert '<div class="libelle">Anomalies</div>' not in rapport
+    assert v == avant
+
+
+def test_consolide_repartit_originaux_sans_attribuer_fusion_au_type_principal():
+    v = _verdict_multiagents()
+    rapport = generer_rapport_consolide([v])
+    bruts = rapport.split('<h2>Signalements bruts par agent</h2>')[1].split('<h2>Problèmes consolidés</h2>')[0]
+    assert _carte(1, "coherence") in bruts
+    assert _carte(1, "realisme") in bruts
+    assert _carte(2, "Total des signalements bruts") in bruts
+    assert _carte(1, "Total des problèmes consolidés") in rapport
+    assert _carte(1, "Problèmes confirmés par plusieurs agents") in rapport
+    assert '<th>Signalements bruts</th><th>Problèmes consolidés</th><th>Lignes affectées</th>' in rapport
+    assert '<td>C</td><td>73.4474</td><td>2</td><td>1</td><td>1</td>' in rapport
+    assert 'Anomalies par type' not in rapport
+
+
+def test_compteurs_consolides_additionnent_plusieurs_fichiers():
+    rapport = generer_rapport_consolide([_verdict_multiagents(), _verdict_multiagents()])
+    assert _carte(2, "coherence") in rapport
+    assert _carte(2, "realisme") in rapport
+    assert _carte(4, "Total des signalements bruts") in rapport
+    assert _carte(2, "Total des problèmes consolidés") in rapport
+    assert _carte(2, "Problèmes confirmés par plusieurs agents") in rapport
+
+
+def test_sources_et_nombre_signalements_sont_echappes():
+    v = _verdict_multiagents()
+    a = v['anomalies_consolidees'][0]
+    a['sources'] = ['<script>source</script>']
+    a['nb_signalements'] = '<img src=x>'
+    rapport = generer_rapport_fichier(v, [])
+    assert '<script>' not in rapport and '<img src=x>' not in rapport
+    assert '&lt;script&gt;source&lt;/script&gt;' in rapport
+    assert '&lt;img src=x&gt;' in rapport
+
+
+def test_origines_manquantes_ne_deviennent_pas_de_faux_compteurs_bruts():
+    v = _verdict_multiagents()
+    del v['anomalies_consolidees'][0]['signalements_originaux']
+    rapport = generer_rapport_consolide([v])
+    assert 'Répartition complète indisponible' in rapport
+    assert 'Type principal des problèmes consolidés' in rapport
+    assert _carte(1, 'Problèmes confirmés par plusieurs agents') in rapport
+
+
+def test_reporting_incomplete_preserve_compteurs_et_score_absent():
+    v = _verdict_multiagents()
+    v.update(pipeline_status='INCOMPLETE', score=None, grade=None, verdict=None)
+    avant = deepcopy(v)
+    for rapport in (generer_rapport_fichier(v, []), generer_rapport_consolide([v])):
+        assert 'badge-INCOMPLETE' in rapport
+        assert '73.4474' not in rapport
+        assert 'coherence' in rapport and 'realisme' in rapport
+    assert v == avant

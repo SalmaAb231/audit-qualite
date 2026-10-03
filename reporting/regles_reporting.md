@@ -15,28 +15,56 @@ LLM — pure présentation.
   sévérité sommées, top anomalies les plus fréquentes, évolution par mois,
   tableau des fichiers du plus problématique au meilleur).
 
+## Présentation des résultats du Judge consolidé
+
+Le résumé individuel distingue `nb_signalements_bruts` (repli historique
+`anomalies_total_brutes`), `nb_problemes_consolides` (repli
+`nb_anomalies_total`) et `lignes_affectees`. Les cartes portent les libellés
+« Signalements bruts », « Problèmes consolidés » et « Lignes affectées ».
+La couverture estimée déjà calculée par le Judge est affichée explicitement.
+
+Le tableau détaillé conserve le type principal, toutes les `sources` et
+`nb_signalements`. Une provenance absente dans un ancien résultat se replie
+sur son type, puis sa source. Aucun calcul de score ou de consolidation
+n'est effectué dans le reporting.
+
+Le rapport consolidé distingue :
+- « Signalements bruts par agent » : compte les `signalements_originaux`
+  conservés par le Judge, une fois chacun, et affiche leur total ;
+- « Problèmes consolidés » : somme des compteurs du Judge ;
+- « Problèmes confirmés par plusieurs agents » : nombre de problèmes dont
+  `sources` contient plusieurs agents distincts ;
+- « Problèmes consolidés par sévérité » : compteurs consolidés du Judge.
+
+Si les originaux d'un problème multi-agents sont indisponibles, le rapport
+signale que la répartition brute est indisponible. Il affiche les compteurs
+historiques sous le titre explicite « Type principal des problèmes
+consolidés », sans les présenter comme des signalements bruts. Les données
+absentes ne sont pas inventées. Le tableau final par fichier distingue les
+trois compteurs bruts / consolidés / lignes affectées.
+
 ## Forme attendue de `fichiers_verdicts`
 
 La signature demandée est `generer_rapport_consolide(fichiers_verdicts: list[dict])`
 — une liste de verdicts, sans paramètre séparé pour les anomalies brutes.
-Or "top anomalies les plus fréquentes" a besoin du détail par anomalie
-(colonnes, justification), que le verdict seul (`judge.agent_judge.analyser()`)
-ne contient pas — il ne contient que des compteurs agrégés
-(`anomalies_par_type`, `anomalies_par_severite`).
+Le Judge actuel fournit le détail sous `anomalies_consolidees`, avec l'alias
+`anomalies`, ainsi que les compteurs agrégés. Le reporting utilise en
+priorité `anomalies_consolidees` pour les tableaux et les fréquences.
 
 Décision : chaque dict de `fichiers_verdicts` peut porter deux clés
 optionnelles, au-delà du contrat de `analyser()` :
 
-- `"anomalies"` (`list[dict]`) : anomalies brutes de ce fichier. Absente →
+- `"anomalies"` (`list[dict]`) : alias du détail consolidé de ce fichier.
+  Si les deux clés de détail sont absentes →
   ce fichier ne contribue pas au top des anomalies fréquentes, sans erreur
   (section explicitement signalée comme incomplète plutôt que silencieuse).
 - `"dossier_mois"` (`str`, ex. `"LOAD_LOCK_202603"`) : nécessaire pour
   "Évolution par mois". Absente sur tous les fichiers → section explicite
   "aucune information de mois disponible", jamais un tableau vide muet.
 
-`orchestrateur.py` ajoute actuellement `"anomalies"` et `"dossier_mois"` à
-chaque verdict avant la sauvegarde et avant la construction du rapport
-consolidé. La CLI autonome du Judge ajoute elle aussi le détail des anomalies,
+`orchestrateur.py` ajoute `"dossier_mois"` au verdict ; le Judge fournit déjà
+le détail des problèmes avant la sauvegarde et la construction du rapport
+consolidé. La CLI autonome du Judge conserve elle aussi ce détail,
 mais ne peut connaître le mois d'origine que si cette information figure dans
 son entrée.
 

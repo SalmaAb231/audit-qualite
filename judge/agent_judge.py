@@ -9,6 +9,7 @@ import re
 import sys
 import unicodedata
 from collections import Counter, defaultdict
+from copy import deepcopy
 from pathlib import Path
 
 from loguru import logger
@@ -81,7 +82,7 @@ def _normaliser_anomalie(nom_fichier: str, brut: dict) -> dict:
     if portee not in {"ligne", "colonne", "fichier"}:
         portee = "ligne" if ligne is not None or lignes else "inconnue"
     nb_affectees = _entier(brut.get("nb_lignes_affectees"))
-    regle = _canonique(brut.get("regle", brut.get("rule_id"))).replace(" ", "_")
+    regle = _canonique(brut.get("regle") or brut.get("rule_id")).replace(" ", "_")
     justification = _texte(brut.get("justification")) or "Anomalie sans justification fournie."
 
     # Reconnaissance ciblée des messages structurels réellement émis aujourd'hui.
@@ -108,26 +109,87 @@ def _normaliser_anomalie(nom_fichier: str, brut: dict) -> dict:
         valeur=_texte(brut.get("valeur")), justification=justification,
         confiance=_confiance(brut.get("confiance", brut.get("confidence"))),
         portee=portee, nb_lignes_affectees=nb_affectees, regle=regle,
-        probleme_id=_canonique(brut.get("probleme_id", brut.get("problem_id"))),
+        probleme_id=_canonique(brut.get("probleme_id") or brut.get("problem_id")),
+        problem_family=_canonique(brut.get("problem_family")),
+        colonne_principale=_texte(brut.get("colonne_principale", brut.get("main_column"))),
+        _original=deepcopy(brut),
         blocking=(type_ == "structure" and source == "stats" and regle in REGLES_BLOQUANTES),
     )
     return anomalie
+
+
+def _colonnes_compatibles(a: dict, b: dict) -> bool:
+    ca, cb = set(a["colonnes"]), set(b["colonnes"])
+    if ca == cb:
+        return True
+    if not ca or not cb:
+        return False
+    if ca <= cb or cb <= ca:
+        return True
+    principales = {a["colonne_principale"], b["colonne_principale"]} - {""}
+    if len(principales) == 1 and principales <= ca & cb:
+        return True
+    if not principales and _diagnostics_concordants(a, b):
+        for colonne in ca & cb:
+            valeur = _valeur_colonne(a, colonne)
+            if valeur and valeur == _valeur_colonne(b, colonne):
+                return True
+    return len(ca & cb) / len(ca | cb) >= config.JUDGE_SIMILARITE_COLONNES
+
+
+def _valeur_colonne(anomalie: dict, colonne: str) -> str:
+    """Extrait une valeur déjà signalée, sans interpréter le dataset ni le métier."""
+    texte = anomalie["valeur"]
+    affectation = re.search(
+        rf"(?<!\w){re.escape(colonne)}\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^,;]+))",
+        texte, flags=re.IGNORECASE,
+    )
+    if affectation:
+        return _canonique(next(v for v in affectation.groups() if v is not None))
+    if anomalie["colonnes"] == [colonne]:
+        return _canonique(texte)
+    return ""
+
+
+def _diagnostics_concordants(a: dict, b: dict) -> bool:
+    """Repli lexical conservateur pour les anciens signalements sans identifiant."""
+    ta = set(_canonique(a["justification"]).split())
+    tb = set(_canonique(b["justification"]).split())
+    for haut, bas in (("haut", "bas"), ("superieur", "inferieur"), ("avant", "apres")):
+        if (haut in ta and bas in tb) or (bas in ta and haut in tb):
+            return False
+    # Ne compte ni les nombres/unités, ni les noms de colonnes, ni les mots génériques.
+    generiques = set("la le les un une des du de d a au aux et ou est sont pour ce cette ces dans en sur avec par pas non sans valeur valeurs colonne colonnes fichier ligne donnees anomalie probleme correspond contient affiche attendu devrait meme kW kw ps ch prix puissance vehicule moteur".split())
+    generiques |= {_canonique(c) for c in a["colonnes"] + b["colonnes"]}
+    communs = {mot for mot in ta & tb if len(mot) > 2 and mot not in generiques and not any(c.isdigit() for c in mot)}
+    return len(communs) >= 2
 
 
 def _meme_probleme(a: dict, b: dict) -> bool:
     """Ne fusionne jamais sur la seule ligne ou la seule sévérité."""
     if any(a[k] != b[k] for k in ("fichier", "ligne", "lignes", "portee")):
         return False
-    ca, cb = set(a["colonnes"]), set(b["colonnes"])
-    if ca != cb and (not ca or not cb or len(ca & cb) / len(ca | cb) < config.JUDGE_SIMILARITE_COLONNES):
+    if not _colonnes_compatibles(a, b):
         return False
-    if a["regle"] or b["regle"]:
-        return bool(a["regle"] and a["regle"] == b["regle"])
-    if a["probleme_id"] or b["probleme_id"]:
-        return bool(a["probleme_id"] and a["probleme_id"] == b["probleme_id"])
+    identifiants = ("regle", "probleme_id", "problem_family")
+    # Une contradiction explicite ne doit jamais être masquée par le texte.
+    if any(a[k] and b[k] and a[k] != b[k] for k in identifiants):
+        return False
+    for cle in identifiants:
+        if a[cle] and b[cle]:
+            return True
+    if any(a[k] or b[k] for k in identifiants):
+        return False
     ja, jb = _canonique(a["justification"]), _canonique(b["justification"])
     if ja == jb and ja != _canonique("Anomalie sans justification fournie."):
         return _canonique(a["valeur"]) == _canonique(b["valeur"]) or not a["valeur"] or not b["valeur"]
+    # Sans métadonnées, inclusion seule insuffisante : même valeur dans une
+    # colonne commune ET diagnostics concordants. Aucun raisonnement métier.
+    if _diagnostics_concordants(a, b):
+        for colonne in set(a["colonnes"]) & set(b["colonnes"]):
+            valeur = _valeur_colonne(a, colonne)
+            if valeur and valeur == _valeur_colonne(b, colonne):
+                return True
     ta, tb = set(ja.split()), set(jb.split())
     def sensibles(mots):
         return {mot for mot in mots if any(c.isdigit() for c in mot) or mot in {"pas", "non", "sans", "avant", "apres", "haut", "bas"}}
@@ -154,6 +216,8 @@ def _consolider(anomalies: list) -> list:
         for cluster in clusters:
             principale = sorted(cluster, key=lambda a: (-ORDRE_SEVERITE[a["severite"]], -a["confiance"], a["type"], a["justification"]))[0]
             fusion = dict(principale)
+            fusion.pop("_original", None)
+            fusion["signalements_originaux"] = [deepcopy(a["_original"]) for a in cluster]
             fusion["sources"] = sorted({s for a in cluster for s in a["sources"]})
             fusion["colonnes"] = sorted({c for a in cluster for c in a["colonnes"]})
             fusion["confiance"] = max(a["confiance"] for a in cluster)
@@ -247,7 +311,7 @@ def _generer_justification(verdict: str, anomalies: list) -> str:
     if not anomalies:
         return f"Fichier {libelle} : aucune anomalie détectée."
     exemple = max(anomalies, key=lambda a: (ORDRE_SEVERITE[a["severite"]], a["confiance"]))
-    return (f"Fichier {libelle} : {len(anomalies)} anomalie(s) unique(s). "
+    return (f"Fichier {libelle} : {len(anomalies)} problème(s) consolidé(s). "
             f"Exemple le plus sévère (ligne {exemple['ligne']}, colonne(s) {', '.join(exemple['colonnes']) or '-'}) : "
             f"{exemple['justification']}")
 
@@ -297,6 +361,7 @@ def analyser(
         score = score_calcule
         grade = _grade_from_score(score)
         justification = _generer_justification(verdict, uniques)
+        justification += f" {len(brutes)} signalement(s) brut(s) ; {nb_affectees} ligne(s) affectée(s)."
         if blocking:
             justification += " Règle bloquante : " + " ; ".join(raisons)
         if provisoire:
@@ -311,6 +376,7 @@ def analyser(
         "pipeline_status": pipeline_status, "pipeline_reason": pipeline_reason,
         "blocking": blocking, "blocking_reasons": raisons,
         "nb_anomalies_total": len(uniques), "anomalies_total_brutes": len(brutes),
+        "nb_signalements_bruts": len(brutes), "nb_problemes_consolides": len(uniques),
         "anomalies_uniques": len(uniques), "anomalies_invalides": invalides,
         "anomalies_par_type": _compter_par_champ(uniques, "type", config.TYPES_ANOMALIE),
         "anomalies_par_severite": _compter_par_champ(uniques, "severite", tuple(ORDRE_SEVERITE)),

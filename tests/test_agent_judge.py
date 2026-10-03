@@ -320,3 +320,128 @@ def test_cli_lit_taille_et_ecrit_verdict_consolide(tmp_path, monkeypatch, capsys
     assert v["nb_lignes_total"] == 180 and v["anomalies_uniques"] == 1
     assert v["score"] == pytest.approx(99.6667)
     assert "ACCEPTED" in capsys.readouterr().out
+
+
+def signalements_puissance():
+    return [
+        anomalie(5, "critical", "coherence", 0.98,
+                 colonnes=["PowerKW", "PowerPS"], valeur="PowerKW=60, PowerPS=5700",
+                 justification="60 kW correspond à ~81 ch (PS), 5700 PS est physiquement impossible pour ce véhicule ; 5700 est vraisemblablement un régime moteur placé dans la mauvaise colonne."),
+        anomalie(5, "critical", "realisme", 0.99,
+                 colonnes=["PowerPS"], valeur="5700",
+                 justification="Une puissance de 5700 ch (PS) est physiquement impossible pour un moteur 1.2 L hybride (attendu ~80-90 ch)."),
+    ]
+
+
+def test_puissance_inclusion_colonnes_et_tracabilite():
+    brutes = signalements_puissance()
+    avant = deepcopy(brutes)
+    v = analyser(NOM, brutes, 38)
+    assert v["nb_signalements_bruts"] == 2
+    assert v["nb_problemes_consolides"] == 1
+    a = v["anomalies"][0]
+    assert a["colonnes"] == ["PowerKW", "PowerPS"]
+    assert a["severite"] == "critical" and a["confiance"] == 0.99
+    assert a["sources"] == ["coherence", "realisme"] and a["nb_signalements"] == 2
+    assert sorted(a["signalements_originaux"], key=lambda x: x["type"]) == avant
+    a["signalements_originaux"][0]["colonnes"].append("Test")
+    assert brutes == avant
+
+
+def test_prix_multicolonnes_et_valeur_simple():
+    brutes = [
+        anomalie(7, "high", "coherence", 0.95,
+                 colonnes=["Duration", "ListPrice", "Mileage", "Price"],
+                 valeur="Price='37.299,-', ListPrice='€ 37.299,-', Duration=nan, Mileage=nan",
+                 justification="La colonne Price contient le prix catalogue (identique à ListPrice) au lieu d'un loyer mensuel ; Duration et Mileage sont vides."),
+        anomalie(7, "high", "realisme", 0.9, colonnes=["Price"], valeur="37.299,-",
+                 justification="Le prix affiché (37 299 €) correspond au prix catalogue, pas à un loyer mensuel de location longue durée."),
+    ]
+    v = analyser(NOM, brutes, 38)
+    assert v["nb_problemes_consolides"] == 1
+    assert v["anomalies"][0]["colonnes"] == ["Duration", "ListPrice", "Mileage", "Price"]
+
+
+def test_co2_et_prix_meme_ligne_restent_distincts():
+    brutes = [anomalie(5, "high", "coherence", colonnes=["CO2"], problem_family="emission"),
+              anomalie(5, "high", "realisme", colonnes=["Price"], problem_family="prix")]
+    v = analyser(NOM, brutes, 38)
+    assert v["nb_problemes_consolides"] == 2 and v["lignes_affectees"] == 1
+
+
+@pytest.mark.parametrize("champ", ["rule_id", "problem_id", "problem_family"])
+def test_identifiant_prioritaire_sur_descriptions(champ):
+    brutes = [anomalie(5, "high", "coherence", colonnes=["PowerKW", "PowerPS"],
+                      justification="Diagnostic A", valeur="A", **{champ: "puissance"}),
+              anomalie(5, "critical", "realisme", colonnes=["PowerPS"],
+                      justification="Diagnostic B", valeur="B", **{champ: "puissance"})]
+    assert analyser(NOM, brutes, 38)["nb_problemes_consolides"] == 1
+    brutes[1][champ] = "autre probleme"
+    assert analyser(NOM, brutes, 38)["nb_problemes_consolides"] == 2
+
+
+def test_inclusion_seule_ne_prouve_pas_meme_probleme():
+    a, b = signalements_puissance()
+    b["justification"] = "La valeur est manquante après extraction."
+    assert analyser(NOM, [a, b], 38)["nb_problemes_consolides"] == 2
+
+
+def test_colonne_principale_commune_avec_famille():
+    brutes = [anomalie(colonnes=["Price", "Duration"], main_column="Price", problem_family="prix"),
+              anomalie(colonnes=["Price", "Mileage"], main_column="Price", problem_family="prix")]
+    assert analyser(NOM, brutes, 38)["nb_problemes_consolides"] == 1
+
+
+def test_colonne_principale_commune_deduite_des_signalements():
+    brutes = [anomalie(colonnes=["Price", "Duration"], valeur="Price='500', Duration=36",
+                      justification="Le loyer mensuel est incohérent."),
+              anomalie(colonnes=["Price", "Mileage"], valeur="Price='500', Mileage=10000",
+                      justification="Loyer mensuel incohérent pour cette offre.")]
+    assert analyser(NOM, brutes, 38)["nb_problemes_consolides"] == 1
+
+
+def test_anti_fusion_transitive_par_inclusion():
+    # A inclus dans B, C inclus dans B, mais A et C disjoints.
+    brutes = [anomalie(colonnes=["CO2"], problem_family="controle"),
+              anomalie(colonnes=["CO2", "Price"], problem_family="controle"),
+              anomalie(colonnes=["Price"], problem_family="controle")]
+    v = analyser(NOM, brutes, 38)
+    assert v["nb_problemes_consolides"] == 2
+    assert sorted(a["nb_signalements"] for a in v["anomalies"]) == [1, 2]
+    assert analyser(NOM, list(reversed(brutes)), 38) == v
+
+
+def test_identifiants_contradictoires_non_masques_par_famille():
+    brutes = [anomalie(problem_id="prix trop haut", problem_family="prix"),
+              anomalie(problem_id="prix trop bas", problem_family="prix")]
+    assert analyser(NOM, brutes, 38)["nb_problemes_consolides"] == 2
+
+
+def test_consolidation_interagents_sans_double_penalite():
+    a, b = signalements_puissance()
+    v = analyser(NOM, [a, b], 38)
+    assert v["score"] == analyser(NOM, [b], 38)["score"]
+    assert v["penalite"] == round(100 * 0.99 / 38, 4)
+    assert v["lignes_affectees"] == 1
+
+
+def test_compteurs_et_justification_distinguent_signalements_problemes_lignes():
+    brutes = signalements_puissance() + [anomalie(5, "medium", colonnes=["CO2"])]
+    v = analyser(NOM, brutes, 38)
+    assert (v["nb_signalements_bruts"], v["nb_problemes_consolides"], v["lignes_affectees"]) == (3, 2, 1)
+    assert v["anomalies_total_brutes"] == 3
+    assert v["anomalies_uniques"] == v["nb_anomalies_total"] == 2
+    assert "2 problème(s) consolidé(s)" in v["justification"]
+    assert "3 signalement(s) brut(s)" in v["justification"]
+    assert "1 ligne(s) affectée(s)" in v["justification"]
+    assert "unique" not in v["justification"]
+
+
+def test_consolidation_preserve_incomplete_et_blocage_structure():
+    brutes = signalements_puissance()
+    incomplet = analyser(NOM, brutes, 38, pipeline_status="INCOMPLETE")
+    assert all(incomplet[k] is None for k in ("score", "grade", "verdict", "penalite"))
+    assert incomplet["nb_problemes_consolides"] == 1
+    brutes.append(anomalie(0, "low", "structure", rule_id="structure_inexploitable"))
+    bloque = analyser(NOM, brutes, 38)
+    assert bloque["blocking"] and bloque["verdict"] == "REJECTED"

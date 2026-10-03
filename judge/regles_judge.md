@@ -40,15 +40,17 @@ Aucun nombre total de lignes n'est inventé à partir du dernier index.
 ## Déduplication et consolidation
 
 Les candidats doivent concerner le même fichier, la même ligne/liste
-d'index et la même portée. Leurs colonnes doivent être identiques ou avoir
-une similarité de Jaccard d'au moins JUDGE_SIMILARITE_COLONNES (0,8).
+d'index et la même portée. Leurs colonnes doivent être identiques, incluses
+l'une dans l'autre, partager une colonne principale établie, ou avoir une
+similarité de Jaccard d'au moins JUDGE_SIMILARITE_COLONNES (0,8).
 
 Le problème doit ensuite correspondre :
-1. même identifiant de règle, si présent ;
-2. sinon même probleme_id, si présent ;
-3. sinon justification identique après normalisation des accents/casse/
+1. même identifiant de règle (`regle` / `rule_id`), si présent des deux côtés ;
+2. sinon même `probleme_id` / `problem_id` ;
+3. sinon même `problem_family` ;
+4. sinon justification identique après normalisation des accents/casse/
    ponctuation, avec valeurs compatibles ;
-4. sinon même valeur et justifications très proches (Jaccard >= 0,85,
+5. sinon même valeur et justifications très proches (Jaccard >= 0,85,
    au moins cinq mots), sans différence de nombres ni de mots sensibles
    tels que non, pas, avant/apres, haut/bas.
 
@@ -56,7 +58,8 @@ Tous les membres d'un groupe doivent être compatibles : une chaîne de
 ressemblances ne suffit pas. La seule ligne, les seules colonnes ou la
 seule sévérité ne permettent jamais de fusionner. Pas de compréhension
 sémantique par LLM : les paraphrases très différentes restent distinctes
-si aucun identifiant commun n'est fourni.
+si aucun identifiant commun ni élément concordant sur la colonne et la
+valeur du problème n'est fourni.
 
 Une fusion conserve la sévérité maximale, la confiance maximale, l'union
 des colonnes et des sources (noms des détecteurs), toutes les justifications
@@ -64,6 +67,43 @@ et nb_signalements. La justification principale est choisie de façon stable
 (sévérité, confiance, type, texte). Les compteurs par type attribuent le
 problème une seule fois au type principal ; sources conserve la provenance
 complète. Aucun changement des agents n'est nécessaire.
+
+### Consolidation inter-agents
+
+Les colonnes sont également compatibles si un ensemble non vide est inclus
+dans l'autre, ou si les deux signalements partagent une colonne principale
+explicite (`colonne_principale` / `main_column`). Sans colonne principale
+explicite, une valeur identique attribuée à une colonne commune et des
+diagnostics concordants peuvent établir cette compatibilité.
+
+Une identité structurée commune est prioritaire sur le texte. Tout conflit
+entre identifiants renseignés des deux côtés interdit la fusion, même si la
+famille ou le texte est identique. Un identifiant renseigné d'un seul côté
+ne suffit pas : en l'absence d'identifiant commun, ces signalements restent
+séparés.
+
+Pour les anciens signalements sans identifiant, le repli inter-agents exige
+la même valeur dans une colonne commune (valeur simple ou affectation
+`Colonne=valeur`) et au moins deux mots descriptifs communs, hors nombres,
+unités, noms de colonnes et mots génériques. Les diagnostics opposés
+haut/bas, supérieur/inférieur et avant/après restent séparés. Ce repli est
+lexical et conservateur : il ne refait aucune analyse métier et ne garantit
+pas la fusion de toutes les paraphrases possibles.
+
+L'inclusion des colonnes ou la seule ligne ne prouvent jamais le même
+problème. Chaque nouveau membre doit correspondre à **tous** les membres du
+groupe ; l'union des colonnes ne sert pas de pont pour fusionner deux
+problèmes incompatibles. `signalements_originaux` contient une copie
+indépendante de chaque signalement reçu pour la traçabilité.
+
+Le verdict distingue `nb_signalements_bruts`, `nb_problemes_consolides` et
+`lignes_affectees`. La justification emploie « problèmes consolidés ».
+Les champs historiques `anomalies_total_brutes`, `anomalies_uniques` et
+`nb_anomalies_total` sont conservés comme alias pour les consommateurs
+existants ; les deux derniers comptent les problèmes après consolidation,
+sans prétendre à une déduplication sémantique exhaustive. Les rapports
+existants reçoivent cette liste consolidée et ces compteurs sans modification
+du module reporting.
 
 ## Score global progressif sur 100
 
