@@ -84,7 +84,7 @@ MODELES = {
     "realisme": [
         "nvidia/nemotron-3-ultra-550b-a55b:free",
         "google/gemma-4-31b-it:free",        # supporte les tools aussi
-        "openai/gpt-oss-20b:free",           # si encore présent au catalogue
+        "google/gemma-4-26b-a4b-it:free",    # gratuit, contexte 262K, sorties structurées
     ],
 
     # Tâche simple (justification du verdict, quelques phrases) → modèle léger
