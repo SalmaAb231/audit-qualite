@@ -60,14 +60,26 @@ complet non filtré.
 
 ## Robustesse
 
-- Un échec d'appel LLM sur un chunk (exception, timeout, JSON invalide même
-  après les stratégies de récupération de `parse_utils.extraire_json`) est
-  journalisé et traité comme "aucune anomalie sur ce chunk" : il n'interrompt
-  jamais le traitement des chunks suivants ni ne fait échouer `analyser()`.
-- Un DataFrame vide retourne `[]` immédiatement, sans consommer de requête.
+- Un échec d'appel LLM sur un chunk (exception, timeout, quota ou JSON invalide
+  après tous les retries) n'interrompt pas les chunks suivants, mais il n'est
+  plus assimilé à « aucune anomalie ». `analyser_avec_statut()` le compte dans
+  `chunks_failed`/`nb_lignes_echec` et remonte son message dans `error`.
+- `SUCCESS` signifie que tous les chunks ont réussi, `PARTIAL` qu'une partie
+  seulement a réussi, et `FAILED` qu'aucun chunk n'a réussi. Les anomalies des
+  chunks réussis sont conservées même lorsque le statut global est `PARTIAL`.
+- Un DataFrame vide retourne un résultat `SUCCESS` avec zéro chunk et zéro
+  ligne, sans consommer de requête.
 - Chaque anomalie brute renvoyée par le modèle passe par
   `parse_utils.valider_anomalies` (champs requis, énumérations, types) avant
   d'être acceptée.
+
+Deux interfaces sont maintenues :
+
+- `analyser_avec_statut(...)` retourne le résultat structuré complet et doit
+  être utilisé par l'orchestrateur ;
+- `analyser(...)` conserve la compatibilité historique et retourne uniquement
+  la liste d'anomalies. Il ne faut pas l'utiliser lorsqu'un appelant doit
+  distinguer une analyse propre d'un échec technique.
 
 ## Vérification web (pas de tool calling)
 

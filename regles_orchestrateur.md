@@ -142,4 +142,7 @@ conservées pour diagnostic.
 Il n'envoie rien vers S3 (`config.S3_REPORTS_PREFIX`) : tout est écrit en
 local dans `resultats/`. Il ne reprend pas non plus un run interrompu où il
 s'était arrêté (pas de checkpoint façon "reprendre après le fichier N") :
-chaque exécution retraite tout ce qu'on lui donne depuis le début.
+chaque exécution reparcourt tout ce qu'on lui donne depuis le début. Cette
+limite ne concerne pas les chunks de Cohérence : leur checkpoint réutilise les
+chunks déjà réussis et retente uniquement les chunks absents ou en échec. Voir
+`docs/fiabilite_pipeline.md` pour l'identité et les règles de reprise.

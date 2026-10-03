@@ -46,9 +46,10 @@ python -m pytest tests/test_stats.py::test_nom_de_la_fonction -v
 
 `agents/agent_coherence.py` n'a pas de CLI : s'utilise via
 `AgentCoherence().analyser_fichier(chemin)` (voir `agents/test_coherence.py`).
-Ses propres tests vivent à côté de son code
-(`agents/test_coherence.py`, `agents/test_coherence_injection.py`), pas
-dans `tests/`.
+Ses tests automatisés de checkpoints et de statuts vivent dans
+`tests/test_agent_coherence.py`. Les scripts historiques de validation
+manuelle restent à côté du code (`agents/test_coherence.py`,
+`agents/test_coherence_injection.py`).
 
 Aucun test ne fait de véritable appel réseau/LLM — les tests LLM utilisent
 un client factice (`_ClientFactice` dans `tests/test_agent_realisme.py` et
@@ -99,6 +100,10 @@ d'orchestration. Points clés :
   et arrête proprement le run à 0 restant, plutôt que de laisser Réalisme
   produire silencieusement "aucune anomalie" à cause du blocage interne de
   quota (ce qui donnerait un verdict ACCEPTED propre en apparence mais faux).
+- Cohérence et Réalisme remontent `SUCCESS`, `PARTIAL` ou `FAILED`. Si l'un
+  des deux n'est pas complet, le Judge reçoit `pipeline_status="INCOMPLETE"`
+  et ne publie ni score, ni grade, ni verdict. Voir
+  `docs/fiabilite_pipeline.md` avant de modifier cette propagation.
 
 ### Choix de conception : schema-agnostic
 
@@ -176,6 +181,8 @@ module ne définit ses propres constantes de configuration. Notamment :
   (`resultats/coherence/checkpoints/`, reprise sans re-consommer de
   requête), sauvegarde son résultat complet dans
   `resultats/coherence/<fichier>.json`.
+  L'identité combine chemin source relatif, SHA-256 du contenu et version de
+  checkpoint ; seuls les chunks réussis sont réutilisés.
 - **`agent_realisme.py`** : une valeur a-t-elle un sens dans le monde réel
   automobile (par opposition à la contradiction entre colonnes de
   Cohérence, ou à l'aberration purement statistique de stats/) ? Découpe
@@ -225,7 +232,7 @@ ci-dessus).
 
 - **Quota LLM partagé, très tendu** :
   `config.RATE_LIMIT["max_requetes_jour"] = 45` requêtes/jour, partagé par
-  Cohérence, Réalisme et Judge. Cohérence seule (tout le fichier, en
+  Cohérence et Réalisme. Le Judge est déterministe. Cohérence seule (tout le fichier, en
   chunks) peut coûter plusieurs dizaines de requêtes par fichier : un seul
   gros fichier peut épuiser le quota du jour sur un run multi-fichiers.
   `agents.llm_client.quota_restant()` donne le solde restant.

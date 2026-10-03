@@ -34,14 +34,20 @@ optionnelles, au-delà du contrat de `analyser()` :
   "Évolution par mois". Absente sur tous les fichiers → section explicite
   "aucune information de mois disponible", jamais un tableau vide muet.
 
-`judge/agent_judge.py` enrichit déjà ses fichiers `verdict_*.json` sauvegardés
-avec la clé `"anomalies"` (voir sa CLI) : la commande `consolide` de ce
-module les lit directement depuis `config.RESULTATS_DIR`, sans transformation
-supplémentaire. `"dossier_mois"` n'est renseigné par aucun module existant
-aujourd'hui — c'est le futur orchestrateur qui connaît le sous-dossier
-`LOAD_LOCK_AAAAMM` d'origine de chaque fichier (voir `ingestion/local_loader.py`,
-`FichierInfo.dossier_mois`, même nom de clé réutilisé par cohérence) et
-devra l'ajouter à chaque verdict avant de construire la liste consolidée.
+`orchestrateur.py` ajoute actuellement `"anomalies"` et `"dossier_mois"` à
+chaque verdict avant la sauvegarde et avant la construction du rapport
+consolidé. La CLI autonome du Judge ajoute elle aussi le détail des anomalies,
+mais ne peut connaître le mois d'origine que si cette information figure dans
+son entrée.
+
+## Analyses incomplètes
+
+Un verdict portant `pipeline_status="INCOMPLETE"` est rendu avec un badge
+« Analyse incomplète ». Son score et son grade `null` sont affichés avec `-`,
+jamais avec zéro. Le rapport consolidé possède un compteur `INCOMPLETE`, les
+inclut dans l'évolution mensuelle et les place visiblement dans le tableau des
+fichiers. Reporting ne tente pas de recalculer un verdict à partir des
+anomalies partielles.
 
 ## "Top anomalies les plus fréquentes" : quelle notion de "même anomalie" ?
 

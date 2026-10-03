@@ -149,6 +149,16 @@ traiter cette règle si elle lui est fournie ; il ne change pas l'ingestion.
 
 ## Verdict et grade
 
+Avant d'appliquer les règles de qualité ci-dessous, le Judge vérifie
+`pipeline_status`. Si sa valeur est `INCOMPLETE`, au moins une étape LLM
+obligatoire n'a pas terminé : le résultat contient alors `score=null`,
+`grade=null`, `verdict=null` et `penalite=null`. Les anomalies déjà détectées,
+les compteurs et `pipeline_reason` sont conservés pour le diagnostic. Cette
+branche empêche un échec technique ou un quota épuisé de devenir un verdict
+`ACCEPTED` fondé sur une liste d'anomalies artificiellement vide.
+
+Les règles suivantes s'appliquent uniquement à un pipeline `COMPLETE`.
+
 | Condition | Verdict |
 |---|---|
 | blocking=true | REJECTED, indépendamment du score |

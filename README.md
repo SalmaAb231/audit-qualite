@@ -8,6 +8,11 @@ un format JSON commun, agrégées ensuite en un **verdict** par fichier
 **rapports HTML**. Déploiement futur sur AWS (S3 + EC2) ; développement et
 tests actuels en local.
 
+Un quatrième état technique, `INCOMPLETE`, est utilisé lorsqu'une étape LLM
+obligatoire n'a pas terminé. Ce n'est pas un verdict qualité : dans ce cas le
+score, le grade et le verdict restent à `null` pour éviter un résultat
+faussement rassurant.
+
 ## Vue d'ensemble du pipeline
 
 ```
@@ -102,6 +107,8 @@ produit ni verdict qualité ni score. Un dossier de résultats séparé par mois
 (`resultats/LOAD_LOCK_AAAAMM/`) évite toute collision entre deux fichiers de
 même nom dans des mois différents. Détails et décisions de conception dans
 [`regles_orchestrateur.md`](regles_orchestrateur.md).
+Les garanties de reprise et de propagation des erreurs sont détaillées dans
+[`docs/fiabilite_pipeline.md`](docs/fiabilite_pipeline.md).
 
 ⚠️ Cohérence traite tout le fichier (pas seulement les lignes suspectes) :
 elle coûte beaucoup plus de requêtes LLM que Réalisme. Sur un run
@@ -156,6 +163,8 @@ python -m stats.agent_stats <fichier_ou_chemin>
   disque des réponses (`cache_llm/`, pour ne jamais repayer une requête
   identique) et le respect strict du quota gratuit quotidien
   (`quota_restant()`).
+  Un JSON invalide est une erreur retentable : le client applique le backoff,
+  essaie la cascade de modèles puis `openrouter/free` en dernier recours.
 - **`parse_utils.py`** : extraction robuste de JSON depuis une réponse LLM
   (qui peut être mal formée, tronquée, entourée de texte) et validation de
   chaque anomalie contre le contrat commun.
@@ -166,6 +175,9 @@ python -m stats.agent_stats <fichier_ou_chemin>
   versionné, identifié par chemin source relatif + SHA-256 du contenu +
   version (`resultats/coherence/checkpoints/`)
   et sauvegarde son résultat complet dans `resultats/coherence/<fichier>.json`.
+  Seuls les chunks réussis sont réutilisés à la reprise ; les chunks en échec
+  sont automatiquement retentés. Une modification du contenu ou de la version
+  de checkpoint crée une nouvelle identité.
   `analyser_fichier(chemin, df=None, anomalies_structure=None)` : les deux
   derniers paramètres sont optionnels — fournis par `orchestrateur.py`
   (appel en parallèle de `stats/`) pour éviter de recharger le fichier et de
@@ -186,6 +198,9 @@ python -m stats.agent_stats <fichier_ou_chemin>
   LLM de vérification par chunk (pas par anomalie), qui confirme ou retire
   une anomalie selon des résultats de recherche récents — pilotable via
   `config.RECHERCHE_WEB_ACTIVEE`.
+  L'API structurée `analyser_avec_statut()` expose les compteurs de chunks et
+  de lignes ainsi que `SUCCESS`/`PARTIAL`/`FAILED`. L'orchestrateur désactive
+  son échantillonnage interne pour analyser exactement le lot qu'il a choisi.
 - **`regles_realisme.md`** : frontière avec Cohérence, mécanisme de
   vérification web en détail, limites connues.
 - **`test_premier_appel.py`** : script de preuve du socle LLM sur un
@@ -203,12 +218,15 @@ python -m agents.agent_realisme <fichier_ou_chemin>
 ### `judge/` — agrégation et verdict
 
 - **`agent_judge.py`** : ne détecte rien, agrège les anomalies déjà
-  produites par tous les détecteurs et calcule un score (0 à 1), un grade
+  produites par tous les détecteurs et calcule un score (0 à 100), un grade
   (A à F) et un verdict (`ACCEPTED`/`WARNING`/`REJECTED`), 100%
   déterministe. Une anomalie `critical`/`high` pèse sans limite ; les
   `medium`/`low` sont plafonnées (`config.PLAFOND_PENALITE_NON_BLOQUANTE`)
   pour qu'un détecteur purement statistique ne puisse jamais, à lui seul,
   rejeter un fichier.
+  Il est entièrement déterministe et ne consomme aucun quota LLM. Lorsque
+  `pipeline_status="INCOMPLETE"`, il conserve le diagnostic mais ne publie
+  aucun score, grade ou verdict qualité.
 - **`regles_judge.md`** : la formule de score en détail, et les
   découvertes de calibration sur données réelles (pourquoi ce plafond a
   été ajouté, pourquoi certaines notes comme "B" restent difficiles à
@@ -227,6 +245,8 @@ python -m judge.agent_judge <chemin_json_anomalies>
   anomalies les plus fréquentes, évolution par mois). Tout texte affiché
   est échappé (protection contre l'injection HTML, les justifications
   provenant en bout de chaîne d'un LLM lisant des données externes).
+  Les analyses incomplètes sont affichées explicitement avec leur propre
+  badge et des valeurs `-` pour le score et le grade absents.
 - **`regles_reporting.md`** : format attendu des données en entrée,
   notion de "même anomalie" pour le calcul de fréquence.
 
@@ -270,10 +290,11 @@ agents LLM sans dépendre uniquement du jugement humain au cas par cas.
 ### `tests/`
 
 Un fichier de test par module (`test_structure.py`, `test_stats.py`,
-`test_agent_realisme.py`, `test_agent_judge.py`, `test_agent_reporting.py`,
-`test_orchestrateur.py`), plus des tests de conformité au contrat commun.
-Les tests de l'agent Cohérence vivent à côté de son code
-(`agents/test_coherence.py`, `agents/test_coherence_injection.py`), pas ici.
+`test_agent_coherence.py`, `test_agent_realisme.py`, `test_agent_judge.py`,
+`test_agent_reporting.py`, `test_orchestrateur.py`), plus des tests de
+conformité au contrat commun. Les scripts historiques de validation manuelle
+de Cohérence vivent aussi à côté de son code (`agents/test_coherence.py`,
+`agents/test_coherence_injection.py`).
 
 Aucun test ne fait d'appel réseau réel : les tests LLM utilisent un client
 factice (voir `_ClientFactice` dans `test_agent_realisme.py` et
@@ -284,7 +305,7 @@ un vrai appel réseau `ddgs`), et les dossiers de résultats/checkpoints de
 Cohérence redirigés vers `tmp_path`.
 
 ```powershell
-python -m pytest tests/ -v
+python -m pytest -q
 ```
 
 ### Dossiers non versionnés (exclus par `.gitignore`)
@@ -339,7 +360,7 @@ python -m pytest tests/ -v
 
 - **Quota LLM partagé, désormais beaucoup plus tendu** :
   `config.RATE_LIMIT["max_requetes_jour"] = 45`, partagé par tout le projet
-  (Cohérence, Réalisme, Judge). Un appel LLM peut prendre de 30 secondes à
+  (Cohérence et Réalisme ; le Judge est déterministe). Un appel LLM peut prendre de 30 secondes à
   plusieurs minutes sur le tier gratuit. Depuis l'ajout de Cohérence (traite
   tout le fichier, pas juste les lignes suspectes) et de la vérification web
   de Réalisme (un appel de plus par chunk), **un seul gros fichier peut
