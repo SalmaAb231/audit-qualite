@@ -23,6 +23,7 @@ from agents.agent_realisme import (
     _rechercher_web,
     _verifier_avec_recherche_web,
     analyser,
+    analyser_avec_statut,
 )
 from agents.llm_client import AppelMetadata
 
@@ -150,6 +151,55 @@ def test_analyser_appel_leve_une_exception_ne_bloque_pas():
     assert analyser(NOM_FICHIER_TEST, _df_simple(2), client=_ClientExplosif()) == []
 
 
+def test_analyser_avec_statut_succes_sans_anomalie_est_complet():
+    client = _ClientFactice(reponses=[({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
+
+    resultat = analyser_avec_statut(NOM_FICHIER_TEST, _df_simple(2), client=client)
+
+    assert resultat["anomalies"] == []
+    assert resultat["status"] == "SUCCESS"
+    assert resultat["analyse_complete"] is True
+    assert resultat["chunks_success"] == 1
+    assert resultat["chunks_failed"] == 0
+
+
+def test_analyser_avec_statut_echec_llm_nest_pas_un_succes_vide():
+    client = _ClientFactice(reponses=[(None, AppelMetadata(modele="m", succes=False, erreur="timeout"))])
+
+    resultat = analyser_avec_statut(NOM_FICHIER_TEST, _df_simple(2), client=client)
+
+    assert resultat["anomalies"] == []
+    assert resultat["status"] == "FAILED"
+    assert resultat["analyse_complete"] is False
+    assert resultat["chunks_failed"] == 1
+    assert resultat["error"] == "timeout"
+
+
+def test_analyser_avec_statut_exception_llm_est_failed():
+    resultat = analyser_avec_statut(NOM_FICHIER_TEST, _df_simple(2), client=_ClientExplosif())
+
+    assert resultat["status"] == "FAILED"
+    assert resultat["analyse_complete"] is False
+    assert "panne réseau simulée" in resultat["error"]
+
+
+def test_analyser_avec_statut_multi_chunks_partiel(monkeypatch):
+    monkeypatch.setattr(config, "CHUNK_SIZE", 1)
+    client = _ClientFactice(reponses=[
+        ({"anomalies": []}, AppelMetadata(modele="m", succes=True)),
+        ({"anomalies": []}, AppelMetadata(modele="m", succes=True)),
+        (None, AppelMetadata(modele="m", succes=False, erreur="quota exhausted")),
+    ])
+
+    resultat = analyser_avec_statut(NOM_FICHIER_TEST, _df_simple(3), client=client)
+
+    assert resultat["status"] == "PARTIAL"
+    assert resultat["analyse_complete"] is False
+    assert resultat["chunks_total"] == 3
+    assert resultat["chunks_success"] == 2
+    assert resultat["chunks_failed"] == 1
+
+
 def test_analyser_multi_chunks_agrege(monkeypatch):
     monkeypatch.setattr(config, "CHUNK_SIZE", 2)
     reponses = [
@@ -210,6 +260,31 @@ def test_analyser_echantillon_fichier_geant_reproductible(monkeypatch):
         prompts.append(client.appels[0]["user_prompt"])
 
     assert prompts[0] == prompts[1]
+
+
+def test_analyser_sans_echantillonnage_preserve_toutes_les_lignes_recues(monkeypatch):
+    import agents.agent_realisme as agent_realisme_module
+
+    monkeypatch.setattr(config, "SEUIL_FICHIER_GEANT", 4)
+    monkeypatch.setattr(config, "MAX_LIGNES_PAR_FICHIER", 4)
+    monkeypatch.setattr(config, "CHUNK_SIZE", 3)
+    df = _df_simple(10)
+    df.index = range(100, 110)
+    index_analyses = []
+
+    def _chunk_factice(nom_fichier, chunk, client, num_chunk, nb_chunks):
+        index_analyses.extend(chunk.index.tolist())
+        return {"anomalies": [], "succes": True, "error": None, "nb_lignes": len(chunk)}
+
+    monkeypatch.setattr(agent_realisme_module, "_analyser_chunk", _chunk_factice)
+
+    resultat = analyser_avec_statut(
+        NOM_FICHIER_TEST, df, client=_ClientFactice([]), echantillonner=False
+    )
+
+    assert index_analyses == list(df.index)
+    assert resultat["nb_lignes_recues"] == resultat["nb_lignes_analysees"] == len(df)
+    assert resultat["status"] == "SUCCESS"
 
 
 def test_analyser_appelle_avec_les_bons_parametres_config():

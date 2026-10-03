@@ -1,93 +1,209 @@
-# Règles de l'agent Judge
+﻿# Règles du Judge déterministe (v2)
 
-Ce document décrit `judge/agent_judge.py`, le point de convergence du
-pipeline : il ne détecte rien lui-même, il agrège les anomalies déjà
-produites par `structure/`, `stats/`, et les agents LLM (`Cohérence`,
-`Réalisme`), toutes conformes à `docs/contrat_anomalie.md`. 100%
-déterministe, aucun appel LLM — voir la section "Justification" plus bas
-pour pourquoi.
+## Pourquoi le score change
 
-## Formule de score
+L'ancien score sur [0, 1] additionnait les signalements sans connaître la
+taille du fichier. Une seule high retirait 0,7 et une critical saturait le
+score à zéro. Un doublon entre détecteurs pesait plusieurs fois. Ce score
+confondait gravité, fréquence et exploitabilité.
 
-Pour chaque anomalie : poids = `config.PONDERATION_SEVERITE[severite]`,
-doublé si `severite == "critical"` (`config.FACTEUR_PENALITE_CRITICAL`).
-Les poids `high`/`critical` s'additionnent sans limite ; les poids
-`medium`/`low` s'additionnent séparément mais leur somme est plafonnée à
-`config.PLAFOND_PENALITE_NON_BLOQUANTE` (voir plus bas, correctif ajouté
-après calibration sur données réelles). `score = 1.0 - (pénalité grave +
-pénalité non bloquante plafonnée)`, borné à `[0.0, 1.0]`. Grade (A-F) et
-verdict (ACCEPTED/WARNING/REJECTED) dérivés du même score via
-`config.SEUILS_GRADE` et `config.SEUIL_ACCEPTED`/`SEUIL_WARNING`.
+Le Judge reste sans LLM, sans accès réseau et sans horloge : mêmes entrées
+et même configuration donnent les mêmes résultats, même si l'ordre des
+anomalies change. Il ne modifie pas les anomalies reçues.
 
-## Correctif ajouté après calibration sur données réelles : plafond des sévérités non bloquantes
+## Entrée et normalisation
 
-Calibration effectuée sur 59 fichiers réels de `LOAD_LOCK_202604`, déjà
-validés par des experts métier (donc attendus sans problème bloquant).
-Avec la formule initiale (pas de plafond), **50 fichiers sur 59 (85%)**
-sortaient REJECTED/score=0, y compris des fichiers avec seulement 3
-anomalies `medium`/`low` (ex. `NL_B2B_LYS_OFF.xlsx` : 3 anomalies medium →
-pénalité 1.2 → score 0). Cause : `stats/` ne produit jamais de sévérité
-`high`/`critical` (voir `stats/regles.md`) — sur un fichier à structure
-saine, tout le poids vient donc de `medium`/`low`, qui s'accumulait sans
-limite. Un fichier de 213 220 lignes avec un taux d'anomalies statistiques
-de seulement 1.7% (voir `stats/regles.md`, deuxième limite) atteint déjà
-plusieurs milliers d'anomalies en valeur absolue, largement assez pour
-saturer le score à 0 — un artefact de la taille du fichier, pas de sa
-qualité réelle.
+Signature : analyser(nom_fichier, anomalies, nb_lignes_total=None).
 
-**Correctif** : `config.PLAFOND_PENALITE_NON_BLOQUANTE = 0.25` plafonne la
-pénalité cumulée `medium`/`low`. Conséquence directe et recherchée :
-`stats/` seul (qui ne produit jamais `high`/`critical`) ne peut désormais
-plus jamais faire descendre un fichier sous WARNING — cohérent avec le
-principe déjà établi ailleurs dans le projet ("`stats/` ne décide jamais
-qu'un fichier est inexploitable", rôle réservé à `structure/`, voir
-`stats/regles.md` — "Ce que ce module ne fait pas"). Seule une anomalie
-`high` ou `critical` (structure, ou plus tard Cohérence/Réalisme) peut
-désormais faire chuter un fichier jusqu'à REJECTED.
+L'orchestrateur transmet maintenant len(df), y compris pour le rejet
+structurel. Le Judge conserve les champs historiques et ajoute les champs
+de consolidation. Les variantes severity/confidence, stats/realism sont
+acceptées. Une colonne string devient une liste ; les index numériques
+valides deviennent des entiers ; une sévérité inconnue devient medium.
+La confiance absente/invalide vaut 1,0 ; elle est bornée à [0, 1].
+Le type inconnu est conservé sous la catégorie explicite inconnu.
+Un signalement non objet est compté dans anomalies_invalides.
 
-## Limites restantes, découvertes en implémentant la formule initiale
+Extensions facultatives :
+- lignes : liste exacte des index affectés (0-based) ;
+- portee : ligne, colonne ou fichier ;
+- nb_lignes_affectees : compte agrégé quand tous les index ne sont pas disponibles ;
+- probleme_id (ou problem_id) : identifiant stable d'un problème ;
+- regle (ou rule_id) : identifiant stable d'une règle déterministe.
 
-Ces deux points restent vrais après le correctif ci-dessus (qui ne change
-que le traitement `medium`/`low`) — observations arithmétiques, pas des bugs :
+L'index 0 est une vraie ligne tant qu'aucune portée explicite ne dit autrement.
+Les formats historiques connus sont reconnus de manière ciblée :
+fichier vide, colonne entièrement vide, nombre de valeurs manquantes dans
+"(179/180)", et comptes "36 valeur(s)" ou "3 ligne(s)".
+Aucun nombre total de lignes n'est inventé à partir du dernier index.
 
-1. **Le grade B (0.85-0.94) est inatteignable en pratique.** Le poids le
-   plus faible (`low` = 0.2) est déjà supérieur à l'écart entre 1.0 et 0.85
-   (0.15). Dès qu'une seule anomalie existe, même la plus mineure, le score
-   tombe au mieux à 0.8 — directement dans la tranche C, sans jamais
-   traverser B. Seul un fichier à zéro anomalie obtient A ; le grade
-   immédiatement inférieur observable est C, jamais B.
-2. **Le doublement de `critical` (`FACTEUR_PENALITE_CRITICAL`) n'a aucun
-   effet observable sur le résultat final.** `PONDERATION_SEVERITE["critical"]`
-   vaut déjà 1.0 : une seule anomalie critical, même sans doublement, sature
-   déjà la pénalité "grave" au maximum utile (score = 0.0, puisque non
-   plafonnée). Doubler à 2.0 ne change rien puisque le score est de toute
-   façon borné à 0.0 dans les deux cas. Vérifié avec l'exemple de calcul
-   fourni à l'origine (critical + high + medium = pénalité grave 2.7 +
-   medium plafonné 0.25 = 2.95 avec doublement) : sans doublement, pénalité
-   grave 1.7 + 0.25 = 1.95 — dans les deux cas, score = 0.0, verdict
-   REJECTED, grade F.
+## Déduplication et consolidation
 
-Non corrigés : partagés avec l'équipe pour décider si la granularité des
-poids ou des seuils de grade doit encore évoluer, pas une correction
-unilatérale supplémentaire.
+Les candidats doivent concerner le même fichier, la même ligne/liste
+d'index et la même portée. Leurs colonnes doivent être identiques ou avoir
+une similarité de Jaccard d'au moins JUDGE_SIMILARITE_COLONNES (0,8).
 
-## Justification 100% déterministe, pas de LLM
+Le problème doit ensuite correspondre :
+1. même identifiant de règle, si présent ;
+2. sinon même probleme_id, si présent ;
+3. sinon justification identique après normalisation des accents/casse/
+   ponctuation, avec valeurs compatibles ;
+4. sinon même valeur et justifications très proches (Jaccard >= 0,85,
+   au moins cinq mots), sans différence de nombres ni de mots sensibles
+   tels que non, pas, avant/apres, haut/bas.
 
-La signature demandée pour `_generer_justification(verdict, anomalies)` ne
-prend pas de client LLM, et une phrase de synthèse (compte par sévérité +
-exemple le plus grave) n'a pas besoin d'un modèle pour être correcte et
-lisible — contrairement à Cohérence/Réalisme qui doivent juger un contenu
-métier. Aucun appel réseau, donc aucune consommation du quota partagé
-(`config.RATE_LIMIT`), et une sortie 100% reproductible pour les tests.
-Une reformulation par le modèle léger de `config.MODELES["judge"]` reste une
-extension possible si une prose plus travaillée est souhaitée, mais n'est
-pas implémentée ici.
+Tous les membres d'un groupe doivent être compatibles : une chaîne de
+ressemblances ne suffit pas. La seule ligne, les seules colonnes ou la
+seule sévérité ne permettent jamais de fusionner. Pas de compréhension
+sémantique par LLM : les paraphrases très différentes restent distinctes
+si aucun identifiant commun n'est fourni.
 
-## Ce que ce module ne fait pas
+Une fusion conserve la sévérité maximale, la confiance maximale, l'union
+des colonnes et des sources (noms des détecteurs), toutes les justifications
+et nb_signalements. La justification principale est choisie de façon stable
+(sévérité, confiance, type, texte). Les compteurs par type attribuent le
+problème une seule fois au type principal ; sources conserve la provenance
+complète. Aucun changement des agents n'est nécessaire.
 
-Il ne lit jamais le champ `source` d'une anomalie : le score traite une
-anomalie `stats` et une anomalie `llm` de sévérité identique de façon
-strictement identique. Il ne recharge pas non plus les fichiers de données
-ni ne recalcule aucune anomalie : il attend une liste déjà produite et
-conforme au contrat, construite par l'orchestrateur (pas encore écrit) en
-concaténant les listes de tous les détecteurs pour un même fichier.
+## Score global progressif sur 100
+
+Configuration spécifique JUDGE_* dans config.py ; les poids historiques
+PONDERATION_SEVERITE restent disponibles pour le score interne de Cohérence.
+
+| Sévérité | Poids |
+|---|---:|
+| critical | 1,0 |
+| high | 0,6 |
+| medium | 0,25 |
+| low | 0,1 |
+
+Pour une anomalie LLM : poids_effectif = poids_severite × confiance.
+Pour une règle déterministe : poids_effectif = poids_severite.
+
+Pour chaque ligne, on retient le **maximum** des poids effectifs des
+problèmes qui la touchent. Deux problèmes distincts sont bien conservés,
+mais leur addition ne multiplie pas artificiellement le taux de lignes
+touchées. Le risque de la ligne est représenté par son problème le plus grave.
+
+Pour N > 0 :
+    penalite_points = 100 × somme(poids_maximal_par_ligne) / N
+    score = max(0, min(100, 100 − penalite_points))
+
+Avec des lignes distinctes et confiance 1 :
+    score = 100 × (1 − taux_critical − 0,6 × taux_high
+                      − 0,25 × taux_medium − 0,1 × taux_low)
+
+Une critical isolée sur dix lignes donne 90 ; sur 100 000 lignes,
+99,999. Une high sur dix lignes donne 94. Des critical couvrant toutes
+les lignes peuvent encore donner zéro : c'est la proportion touchée,
+pas la présence d'un seul signalement, qui le provoque.
+
+### Comptes agrégés et informations absentes
+
+Sans tous les index, on ne peut pas connaître l'intersection de deux
+populations. À chaque niveau de poids, le Judge retient le maximum entre
+le nombre d'index connus et les comptes agrégés de ce niveau ou plus graves.
+Cela donne une **borne basse** des lignes affectées et de la pénalité :
+on suppose le recouvrement maximal au lieu d'additionner aveuglément.
+Exemple : 30 high et 50 medium sans index, sur 100 lignes :
+30 × 0,6 + 20 × 0,25 = 23 points ; score 77.
+couverture_estimee=true signale cette limite. Le score peut être optimiste :
+ce n'est pas une mesure exacte de couverture.
+
+Une portée colonne/fichier sans compte signifie N lignes ; un signalement
+sans index ni portée identifiable représente au moins une ligne estimée.
+Les index hors limites sont exclus et les comptes limités à N, avec
+couverture_estimee=true. Une liste d'index exacte évite ces approximations.
+
+L'ancien appel à deux arguments reste utilisable. Si N est absent, le
+dénominateur de repli est le nombre de lignes affectées connues/estimées
+(au moins 1), et score_provisoire=true dès qu'il existe des signalements.
+nb_lignes_total reste null. Un tel résultat ne peut pas être ACCEPTED :
+il est au minimum WARNING. Les signalements non objets imposent aussi
+au minimum WARNING. Ces réserves apparaissent dans justification.
+
+Pour N=0, aucune pénalité de ligne n'est calculable : score 100. Un fichier
+vide identifié reste REJECTED par la règle bloquante indépendante du score.
+Pas de sous-scores par dimension : le maximum par ligne permet une formule
+globale simple sans compter deux fois un problème commun à plusieurs canaux.
+
+## Blocking indépendant de la sévérité
+
+Seules les règles déterministes de type structure et source stats figurant
+dans la liste fermée sont bloquantes :
+- fichier_vide ;
+- fichier_illisible ;
+- structure_inexploitable.
+
+Le message exact du détecteur Structure actuel pour un fichier vide est
+reconnu sans nécessiter une modification de ce détecteur. Pour les autres
+cas, il faut fournir regle/rule_id. Un blocking=true isolé, une critical
+ou un texte libre ne suffit pas : aucune règle indispensable au schéma
+n'est inventée. Le Judge recalcule blocking à partir de ces critères.
+Les anomalies Cohérence/Réalisme sont normalisées source=llm et ne sont
+jamais automatiquement bloquantes, même si elles demandent blocking=true.
+
+Le pipeline ignore toujours les fichiers dont l'ingestion retourne None ;
+il n'émet pas encore une anomalie fichier_illisible pour eux. Le Judge sait
+traiter cette règle si elle lui est fournie ; il ne change pas l'ingestion.
+
+## Verdict et grade
+
+| Condition | Verdict |
+|---|---|
+| blocking=true | REJECTED, indépendamment du score |
+| score < 70 | REJECTED |
+| 70 <= score < 90 | WARNING |
+| score >= 90 | ACCEPTED |
+
+Seuils configurables : JUDGE_SEUIL_WARNING et JUDGE_SEUIL_ACCEPTED.
+Les réserves des entrées incomplètes sont décrites plus haut.
+
+Grades : A >= 90 ; B >= 80 ; C >= 70 ; D >= 60 ; sinon F.
+Le grade exprime le score ; il peut rester A avec un verdict REJECTED
+pour une règle bloquante. Les bornes s'appliquent au score publié,
+arrondi à quatre décimales.
+
+## Sortie et compatibilité
+
+Les champs historiques fichier, score, grade, verdict, justification,
+nb_anomalies_total, anomalies_par_type et anomalies_par_severite demeurent.
+score est désormais sur 100 (score_echelle=100) ; nb_anomalies_total et les
+compteurs représentent les problèmes uniques.
+
+Champs ajoutés : blocking, blocking_reasons, anomalies_total_brutes,
+anomalies_uniques, anomalies_invalides, anomalies_consolidees,
+nb_lignes_total, lignes_affectees, taux_lignes_affectees, penalite,
+score_provisoire et couverture_estimee.
+taux_lignes_affectees est une fraction [0, 1] ; penalite est en points /100.
+anomalies est l'alias compatible de anomalies_consolidees. L'orchestrateur
+ne le remplace plus par les listes brutes. Le reporting utilise le détail
+consolidé et marque les nouveaux scores /100 ; les anciens JSON restent lisibles.
+Les anciens rapports ne sont ni migrés ni réécrits par cette refonte.
+
+CLI :
+    python -m judge.agent_judge chemin.json [nb_lignes_total]
+
+Le nombre peut aussi être fourni dans nb_lignes_total/nb_lignes_totales
+du JSON. Le Judge seul peut ainsi être recalculé sans rappeler les LLM.
+
+## Exemple : 180 lignes
+
+Supposons 14 lignes distinctes, aucun blocking et confiance 1 :
+2 critical, 4 high, 3 medium, 5 low.
+
+Lignes affectées = 14 ; taux = 14/180 = 7,7778 %.
+Somme des poids = 2×1 + 4×0,6 + 3×0,25 + 5×0,1 = 5,65.
+Pénalité = 100×5,65/180 = 3,1389 points.
+Score = 96,8611 ; grade A ; verdict ACCEPTED.
+
+Le nombre de problèmes ne suffit pas si les lignes se recouvrent :
+la localisation et la confiance sont nécessaires pour refaire le calcul.
+
+## Validation
+
+tests/test_agent_judge.py couvre les dix cas demandés, la normalisation,
+les limites de confiance, les portées agrégées, les seuils, la stabilité
+par permutation et la compatibilité des rapports. Les tests orchestrateur
+vérifient la transmission de N et l'usage des anomalies consolidées.
+Aucun test de cette refonte n'effectue d'appel LLM/web réel.

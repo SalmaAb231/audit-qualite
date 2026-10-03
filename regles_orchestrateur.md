@@ -62,10 +62,11 @@ manquer un vrai problème.
   `stats/regles.md`) : les outliers suivants de la même colonne ne
   deviennent pas des lignes suspectes via ce mécanisme, seulement via
   l'échantillon aléatoire (probabilité, pas garantie).
-Effet de bord positif observé : en pratique, `len(lot_suspect)` reste très
-inférieur à `config.MAX_LIGNES_PAR_FICHIER` (2000) même sur les plus gros
-fichiers du projet — cette limite de `agents/agent_realisme.py` reste un
-filet de sécurité, plus le mécanisme réellement actif de réduction de coût.
+Quand il appelle Réalisme, l'orchestrateur passe désormais
+`echantillonner=False` : il est l'unique responsable du lot envoyé et aucune
+ligne explicitement suspecte ne peut disparaître dans un second tirage.
+L'échantillonnage historique de `agents/agent_realisme.py` reste disponible
+uniquement pour l'usage autonome de cet agent.
 
 ## Cohérence en parallèle avec Stats
 
@@ -127,24 +128,14 @@ dans `agents/regles_realisme.md` ("Vérification web (pas de tool calling)").
 
 ## Garde-fou de quota
 
-`main()` vérifie `agents.llm_client.quota_restant()` **avant** chaque
-fichier et s'arrête proprement dès qu'il atteint 0, plutôt que de continuer
-à appeler Réalisme jusqu'au blocage interne de `llm_client.py`. Raison :
-un appel bloqué par quota à l'intérieur de `agent_realisme.py` est traité
-comme "aucune anomalie sur ce chunk" (comportement voulu là-bas, pour ne
-jamais faire planter un chunk isolé) — mais enchaîné sur plusieurs fichiers
-consécutifs, cela produirait des verdicts ACCEPTED silencieusement faux
-(Réalisme jamais vraiment exécuté, pas juste "rien trouvé"). Un arrêt net
-avec un fichier de log explicite est préférable à un run complet mais
-partiellement mensonger.
-
-**Limite résiduelle acceptée** : si le quota s'épuise **pendant** le
-traitement d'un fichier (entre deux chunks Réalisme du même fichier), les
-chunks restants de ce fichier précis produisent quand même un verdict, sur
-une couverture Réalisme incomplète, sans marqueur explicite de troncature
-dans le verdict. Non traité ici : nécessiterait de faire remonter un
-indicateur depuis `agents/agent_realisme.py` jusqu'au verdict, changement
-qui dépasse le périmètre de cette itération.
+`main()` vérifie `agents.llm_client.quota_restant()` avant chaque fichier et
+`pipeline_fichier()` le revérifie avant Réalisme. Cohérence et Réalisme
+remontent chacun un statut `SUCCESS`, `PARTIAL` ou `FAILED` avec leurs
+compteurs de chunks. Si une étape LLM obligatoire n'est pas complète, le
+verdict porte `pipeline_status="INCOMPLETE"` et le Judge retourne
+`verdict=null`, `score=null`, `grade=null` au lieu d'un résultat qualité
+faussement rassurant. Les anomalies trouvées par les chunks réussis restent
+conservées pour diagnostic.
 
 ## Ce que ce module ne fait pas
 

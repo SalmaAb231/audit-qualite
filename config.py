@@ -195,7 +195,7 @@ MAX_LIGNES_PAR_FICHIER = 2000
 TAUX_ECHANTILLON_CONTROLE = 0.10
 
 # ---------------------------------------------------------------------------
-# Seuils de verdict global (score de confiance agrégé, entre 0 et 1)
+# Paramètres historiques sur [0, 1] : le Judge v2 utilise JUDGE_* ci-dessous.
 # ---------------------------------------------------------------------------
 
 SEUIL_ACCEPTED = 0.90
@@ -215,7 +215,7 @@ PONDERATION_SEVERITE = {
 }
 
 # ---------------------------------------------------------------------------
-# Judge : score, grade, verdict (judge/agent_judge.py)
+# Ancien Judge : conservé pour compatibilité, inutilisé par le Judge v2.
 # ---------------------------------------------------------------------------
 # Une anomalie 'critical' compte double dans le calcul de pénalité (son
 # poids PONDERATION_SEVERITE["critical"] est multiplié par ce facteur, les
@@ -251,3 +251,11 @@ TYPES_ANOMALIE = ("structure", "statistique", "coherence", "realisme")
 
 # Sources de détection autorisées
 SOURCES_ANOMALIE = ("stats", "llm")
+
+# Judge v2 : poids distincts des poids historiques encore utilisés par Cohérence.
+JUDGE_POIDS_SEVERITE = {"critical": 1.0, "high": 0.6, "medium": 0.25, "low": 0.1}
+JUDGE_SEUIL_ACCEPTED = 90.0
+JUDGE_SEUIL_WARNING = 70.0
+JUDGE_SEUILS_GRADE = {"A": 90.0, "B": 80.0, "C": 70.0, "D": 60.0}
+JUDGE_SIMILARITE_COLONNES = 0.8
+JUDGE_SIMILARITE_PROBLEME = 0.85

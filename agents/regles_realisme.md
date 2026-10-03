@@ -52,11 +52,11 @@ troncature** : le fichier est traité intégralement, même s'il dépasse
 `MAX_LIGNES_PAR_FICHIER`. Toujours journalisé (`logger.warning`), jamais
 silencieux.
 
-En pratique, ce mécanisme ne s'active presque jamais dans le pipeline
-orchestré : `orchestrateur.py` ne transmet déjà qu'un petit sous-ensemble de
-lignes suspectes à cet agent (voir `regles_orchestrateur.md`), largement
-sous `SEUIL_FICHIER_GEANT`. Il s'applique surtout à un appel direct de ce
-module (CLI, tests) sur un fichier complet non filtré.
+Ce mécanisme est désactivé explicitement dans le pipeline orchestré
+(`echantillonner=False`) : `orchestrateur.py` a déjà choisi les lignes
+suspectes et aucune ne doit disparaître dans un second tirage. Il reste un
+filet de sécurité pour l'appel direct de ce module (CLI, tests) sur un fichier
+complet non filtré.
 
 ## Robustesse
 

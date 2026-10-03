@@ -54,6 +54,7 @@ LIBELLES_VERDICT = {
     "ACCEPTED": "Accepté",
     "WARNING": "Accepté sous réserve",
     "REJECTED": "Rejeté",
+    "INCOMPLETE": "Analyse incomplète",
 }
 
 STYLE_COMMUN = """
@@ -71,6 +72,7 @@ tr.sev-low { background: #eef7ee; }
 .badge-ACCEPTED { background: #2e7d32; }
 .badge-WARNING { background: #ef8a00; }
 .badge-REJECTED { background: #c62828; }
+.badge-INCOMPLETE { background: #616161; }
 .summary-grid { display: flex; gap: 1.25rem; margin: 1.25rem 0; flex-wrap: wrap; }
 .summary-card { background: white; border: 1px solid #e5e5e5; border-radius: 8px; padding: 1rem 1.5rem; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
 .summary-card .valeur { font-size: 1.8rem; font-weight: 700; }
@@ -146,16 +148,22 @@ def generer_rapport_fichier(verdict: dict, anomalies: list) -> str:
     premier). Ne lève jamais d'exception sur des champs manquants (valeurs
     de repli affichées à la place).
     """
-    anomalies = anomalies or []
+    anomalies = verdict.get("anomalies_consolidees", anomalies) or []
     fichier = verdict.get("fichier", "")
-    verdict_code = verdict.get("verdict", "")
+    verdict_code = (
+        "INCOMPLETE" if verdict.get("pipeline_status") == "INCOMPLETE"
+        else verdict.get("verdict", "")
+    )
 
     corps = (
         f"<h1>Rapport qualité — {html.escape(fichier)}</h1>"
         f"<p>{_badge(LIBELLES_VERDICT.get(verdict_code, verdict_code), verdict_code)}</p>"
         '<div class="summary-grid">'
-        + _carte_resume(verdict.get("score", "-"), "Score")
-        + _carte_resume(verdict.get("grade", "-"), "Grade")
+        + _carte_resume(
+            verdict.get("score") if verdict.get("score") is not None else "-",
+            "Score /100" if verdict.get("score_echelle") == 100 else "Score",
+        )
+        + _carte_resume(verdict.get("grade") if verdict.get("grade") is not None else "-", "Grade")
         + _carte_resume(verdict.get("nb_anomalies_total", len(anomalies)), "Anomalies")
         + "</div>"
         f"<p>{html.escape(verdict.get('justification') or '')}</p>"
@@ -171,8 +179,11 @@ def generer_rapport_fichier(verdict: dict, anomalies: list) -> str:
 
 
 def _compter_verdicts(fichiers_verdicts: list) -> dict:
-    compteur = Counter(fv.get("verdict") for fv in fichiers_verdicts)
-    return {v: compteur.get(v, 0) for v in ("ACCEPTED", "WARNING", "REJECTED")}
+    compteur = Counter(
+        "INCOMPLETE" if fv.get("pipeline_status") == "INCOMPLETE" else fv.get("verdict")
+        for fv in fichiers_verdicts
+    )
+    return {v: compteur.get(v, 0) for v in ("ACCEPTED", "WARNING", "REJECTED", "INCOMPLETE")}
 
 
 def _sommer_compteurs(fichiers_verdicts: list, champ: str, cles: tuple) -> dict:
@@ -192,7 +203,7 @@ def _signature_anomalie(anomalie: dict) -> tuple:
 def _top_anomalies_frequentes(fichiers_verdicts: list, n: int = NB_TOP_ANOMALIES) -> list:
     compteur = Counter()
     for fv in fichiers_verdicts:
-        for anomalie in fv.get("anomalies") or []:
+        for anomalie in fv.get("anomalies_consolidees", fv.get("anomalies")) or []:
             compteur[_signature_anomalie(anomalie)] += 1
     return compteur.most_common(n)
 
@@ -204,8 +215,10 @@ def _evolution_par_mois(fichiers_verdicts: list) -> dict:
         mois = fv.get("dossier_mois")
         if not mois:
             continue
-        compteur = par_mois.setdefault(mois, {"ACCEPTED": 0, "WARNING": 0, "REJECTED": 0})
-        verdict_code = fv.get("verdict")
+        compteur = par_mois.setdefault(
+            mois, {"ACCEPTED": 0, "WARNING": 0, "REJECTED": 0, "INCOMPLETE": 0}
+        )
+        verdict_code = "INCOMPLETE" if fv.get("pipeline_status") == "INCOMPLETE" else fv.get("verdict")
         if verdict_code in compteur:
             compteur[verdict_code] += 1
     return dict(sorted(par_mois.items()))
@@ -213,7 +226,10 @@ def _evolution_par_mois(fichiers_verdicts: list) -> dict:
 
 def _section_repartition_verdicts(fichiers_verdicts: list) -> str:
     compteur = _compter_verdicts(fichiers_verdicts)
-    cartes = "".join(_carte_resume(compteur[v], LIBELLES_VERDICT[v]) for v in ("ACCEPTED", "WARNING", "REJECTED"))
+    cartes = "".join(
+        _carte_resume(compteur[v], LIBELLES_VERDICT[v])
+        for v in ("ACCEPTED", "WARNING", "REJECTED", "INCOMPLETE")
+    )
     return f'<h2>Répartition des verdicts ({len(fichiers_verdicts)} fichier(s))</h2><div class="summary-grid">{cartes}</div>'
 
 
@@ -249,23 +265,31 @@ def _section_evolution_mensuelle(fichiers_verdicts: list) -> str:
             '<p class="muted">Aucune information de mois disponible pour ces fichiers (clé "dossier_mois" absente).</p>'
         )
     lignes = "".join(
-        f"<tr><td>{html.escape(mois)}</td><td>{c['ACCEPTED']}</td><td>{c['WARNING']}</td><td>{c['REJECTED']}</td></tr>"
+        f"<tr><td>{html.escape(mois)}</td><td>{c['ACCEPTED']}</td><td>{c['WARNING']}</td>"
+        f"<td>{c['REJECTED']}</td><td>{c['INCOMPLETE']}</td></tr>"
         for mois, c in evolution.items()
     )
     return (
         "<h2>Évolution par mois</h2>"
-        "<table><thead><tr><th>Mois</th><th>Accepté</th><th>Accepté sous réserve</th><th>Rejeté</th></tr></thead>"
+        "<table><thead><tr><th>Mois</th><th>Accepté</th><th>Accepté sous réserve</th>"
+        "<th>Rejeté</th><th>Analyse incomplète</th></tr></thead>"
         f"<tbody>{lignes}</tbody></table>"
     )
 
 
 def _section_fichiers(fichiers_verdicts: list) -> str:
-    tries = sorted(fichiers_verdicts, key=lambda fv: fv.get("score", 1.0))
+    tries = sorted(
+        fichiers_verdicts,
+        key=lambda fv: (
+            0 if fv.get("pipeline_status") == "INCOMPLETE" else 1,
+            fv.get("score") if fv.get("score") is not None else float("inf"),
+        ),
+    )
     lignes = "".join(
         f"<tr><td>{html.escape(fv.get('fichier') or '')}</td>"
-        f"<td>{_badge(fv.get('verdict') or '', fv.get('verdict') or '')}</td>"
-        f"<td>{html.escape(str(fv.get('grade', '-')))}</td>"
-        f"<td>{html.escape(str(fv.get('score', '-')))}</td>"
+        f"<td>{_badge('Analyse incomplète', 'INCOMPLETE') if fv.get('pipeline_status') == 'INCOMPLETE' else _badge(fv.get('verdict') or '', fv.get('verdict') or '')}</td>"
+        f"<td>{html.escape(str(fv.get('grade') if fv.get('grade') is not None else '-'))}</td>"
+        f"<td>{html.escape(str(fv.get('score') if fv.get('score') is not None else '-'))}</td>"
         f"<td>{html.escape(str(fv.get('nb_anomalies_total', '-')))}</td></tr>"
         for fv in tries
     )

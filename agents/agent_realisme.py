@@ -51,6 +51,10 @@ from ingestion.local_loader import LocalLoader
 TYPE_ANOMALIE = "realisme"
 SOURCE_ANOMALIE = "llm"
 
+STATUT_SUCCESS = "SUCCESS"
+STATUT_PARTIAL = "PARTIAL"
+STATUT_FAILED = "FAILED"
+
 # Graine de l'échantillonnage des fichiers géants (voir analyser()) : un
 # tirage reproductible plutôt qu'aléatoire à chaque run, pour pouvoir
 # comparer deux exécutions sur le même fichier. Valeur locale à ce module,
@@ -263,11 +267,11 @@ def _verifier_avec_recherche_web(nom_fichier: str, anomalies: list, client: LLMC
 # ---------------------------------------------------------------------------
 
 
-def _analyser_chunk(nom_fichier: str, chunk: pd.DataFrame, client: LLMClient, num_chunk: int, nb_chunks: int) -> list:
+def _analyser_chunk(nom_fichier: str, chunk: pd.DataFrame, client: LLMClient, num_chunk: int, nb_chunks: int) -> dict:
     """
-    Analyse un chunk via le LLM et retourne ses anomalies validées. N'échoue
-    jamais : une exception ou un échec d'appel est journalisé et traité comme
-    "aucune anomalie détectée sur ce chunk" plutôt que de bloquer les suivants.
+    Analyse un chunk via le LLM et retourne ses anomalies avec son statut.
+    Une exception ou un appel en échec reste non bloquant pour les chunks
+    suivants, mais n'est plus confondu avec un succès sans anomalie.
     """
     try:
         reponse, metadata = client.appeler(
@@ -280,13 +284,24 @@ def _analyser_chunk(nom_fichier: str, chunk: pd.DataFrame, client: LLMClient, nu
         )
     except Exception as erreur:
         logger.error(f"{nom_fichier} chunk {num_chunk}/{nb_chunks} : appel LLM échoué ({erreur}).")
-        return []
+        return {
+            "anomalies": [],
+            "succes": False,
+            "error": f"exception pendant l'appel LLM : {erreur}",
+            "nb_lignes": len(chunk),
+        }
 
     if not metadata.succes:
         logger.warning(
             f"{nom_fichier} chunk {num_chunk}/{nb_chunks} : appel LLM en échec "
             f"(modèle={metadata.modele}, erreur={metadata.erreur})."
         )
+        return {
+            "anomalies": [],
+            "succes": False,
+            "error": metadata.erreur or "appel LLM en échec sans détail",
+            "nb_lignes": len(chunk),
+        }
 
     anomalies_brutes = []
     if isinstance(reponse, dict):
@@ -307,7 +322,12 @@ def _analyser_chunk(nom_fichier: str, chunk: pd.DataFrame, client: LLMClient, nu
         f"{nom_fichier} chunk {num_chunk}/{nb_chunks} : {len(anomalies_validees)} anomalie(s) "
         f"de réalisme (modèle={metadata.modele}, depuis_cache={metadata.depuis_cache})."
     )
-    return anomalies_validees
+    return {
+        "anomalies": anomalies_validees,
+        "succes": True,
+        "error": None,
+        "nb_lignes": len(chunk),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +335,15 @@ def _analyser_chunk(nom_fichier: str, chunk: pd.DataFrame, client: LLMClient, nu
 # ---------------------------------------------------------------------------
 
 
-def analyser(nom_fichier: str, df: pd.DataFrame, client: LLMClient | None = None) -> list:
+def analyser_avec_statut(
+    nom_fichier: str,
+    df: pd.DataFrame,
+    client: LLMClient | None = None,
+    echantillonner: bool = True,
+) -> dict:
     """
-    Découpe df en chunks (config.CHUNK_SIZE) et interroge l'agent Réalisme sur
-    chacun. Retourne la liste agrégée des anomalies, chacune conforme à
-    docs/contrat_anomalie.md avec type="realisme" et source="llm".
+    Découpe df en chunks et retourne les anomalies ainsi que l'état global
+    SUCCESS/PARTIAL/FAILED et les compteurs d'exécution.
 
     Un fichier "géant" (> config.SEUIL_FICHIER_GEANT lignes) est échantillonné
     à config.MAX_LIGNES_PAR_FICHIER lignes (tirage aléatoire reproductible,
@@ -329,13 +353,26 @@ def analyser(nom_fichier: str, df: pd.DataFrame, client: LLMClient | None = None
     définie localement à chaque module), pour un comportement cohérent entre
     les deux agents LLM sur les plus gros fichiers — voir regles_realisme.md.
 
-    Ne lève jamais d'exception. Un DataFrame vide retourne [] immédiatement,
-    sans consommer de requête LLM.
+    `echantillonner=False` est utilisé par l'orchestrateur : celui-ci a déjà
+    choisi les lignes suspectes et l'agent doit alors analyser exactement le
+    lot reçu. Le mode autonome historique conserve son filet de sécurité.
     """
     if df is None or df.empty:
-        return []
+        return {
+            "anomalies": [],
+            "status": STATUT_SUCCESS,
+            "analyse_complete": True,
+            "chunks_total": 0,
+            "chunks_success": 0,
+            "chunks_failed": 0,
+            "nb_lignes_recues": 0,
+            "nb_lignes_analysees": 0,
+            "nb_lignes_echec": 0,
+            "error": None,
+        }
 
-    if len(df) > config.SEUIL_FICHIER_GEANT:
+    nb_lignes_recues = len(df)
+    if echantillonner and len(df) > config.SEUIL_FICHIER_GEANT:
         taille_echantillon = min(config.MAX_LIGNES_PAR_FICHIER, len(df))
         logger.warning(
             f"{nom_fichier} : fichier géant ({len(df)} lignes), échantillon de "
@@ -347,11 +384,48 @@ def analyser(nom_fichier: str, df: pd.DataFrame, client: LLMClient | None = None
     chunks = _decouper_en_chunks(df, config.CHUNK_SIZE)
 
     anomalies = []
+    chunks_success = 0
+    chunks_failed = 0
+    nb_lignes_analysees = 0
+    nb_lignes_echec = 0
+    erreurs = []
     for i, chunk in enumerate(chunks):
-        anomalies.extend(_analyser_chunk(nom_fichier, chunk, client, i + 1, len(chunks)))
+        resultat_chunk = _analyser_chunk(nom_fichier, chunk, client, i + 1, len(chunks))
+        if resultat_chunk["succes"]:
+            chunks_success += 1
+            nb_lignes_analysees += resultat_chunk["nb_lignes"]
+            anomalies.extend(resultat_chunk["anomalies"])
+        else:
+            chunks_failed += 1
+            nb_lignes_echec += resultat_chunk["nb_lignes"]
+            if resultat_chunk.get("error"):
+                erreurs.append(str(resultat_chunk["error"]))
+
+    if chunks_failed == 0:
+        status = STATUT_SUCCESS
+    elif chunks_success == 0:
+        status = STATUT_FAILED
+    else:
+        status = STATUT_PARTIAL
 
     logger.info(f"{nom_fichier} : {len(anomalies)} anomalie(s) de réalisme au total sur {len(chunks)} chunk(s).")
-    return anomalies
+    return {
+        "anomalies": anomalies,
+        "status": status,
+        "analyse_complete": status == STATUT_SUCCESS,
+        "chunks_total": len(chunks),
+        "chunks_success": chunks_success,
+        "chunks_failed": chunks_failed,
+        "nb_lignes_recues": nb_lignes_recues,
+        "nb_lignes_analysees": nb_lignes_analysees,
+        "nb_lignes_echec": nb_lignes_echec,
+        "error": " ; ".join(dict.fromkeys(erreurs)) or None,
+    }
+
+
+def analyser(nom_fichier: str, df: pd.DataFrame, client: LLMClient | None = None) -> list:
+    """API historique : retourne uniquement les anomalies pour les appels autonomes existants."""
+    return analyser_avec_statut(nom_fichier, df, client=client, echantillonner=True)["anomalies"]
 
 
 # ---------------------------------------------------------------------------

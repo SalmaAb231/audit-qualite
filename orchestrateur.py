@@ -33,9 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
 from agents.agent_coherence import AgentCoherence
-from agents.agent_realisme import analyser as analyser_realisme
+from agents.agent_realisme import analyser_avec_statut as analyser_realisme
 from agents.llm_client import quota_restant
 from ingestion.local_loader import LocalLoader
+from ingestion.profiling import construire_inventaire
 from judge.agent_judge import analyser as analyser_judge
 from reporting.agent_reporting import generer_rapport_consolide, generer_rapport_fichier
 from stats.agent_stats import analyser as analyser_stats
@@ -87,10 +88,10 @@ def _lignes_suspectes(df: pd.DataFrame, anomalies: list, random_state=None) -> p
 # ---------------------------------------------------------------------------
 
 
-def _analyser_coherence(info, df: pd.DataFrame, anomalies_structure: list, llm_client=None) -> list:
+def _analyser_coherence(info, df: pd.DataFrame, anomalies_structure: list, llm_client=None) -> dict:
     """
     Lance l'agent Cohérence (agents/agent_coherence.py) sur le fichier
-    complet et retourne ses anomalies. Canal indépendant de stats/, mais lui
+    complet et retourne ses anomalies avec son statut d'exécution. Canal indépendant de stats/, mais lui
     transmet le df déjà chargé et les anomalies de structure déjà calculées
     par pipeline_fichier() : elle ne recharge plus le fichier depuis le
     disque ni ne revérifie son exploitabilité une seconde fois (voir la
@@ -98,10 +99,30 @@ def _analyser_coherence(info, df: pd.DataFrame, anomalies_structure: list, llm_c
     checkpoint et sauvegarde son résultat complet dans
     resultats/coherence/<fichier>.json.
     """
-    resultat = AgentCoherence(llm_client=llm_client).analyser_fichier(
+    return AgentCoherence(llm_client=llm_client).analyser_fichier(
         info.chemin, df=df, anomalies_structure=anomalies_structure
     )
-    return resultat.get("anomalies", [])
+
+
+def _resultat_realisme_non_execute(nb_lignes: int, raison: str) -> dict:
+    """Résultat explicite quand Réalisme ne peut pas démarrer."""
+    return {
+        "anomalies": [],
+        "status": "FAILED",
+        "analyse_complete": False,
+        "chunks_total": 0,
+        "chunks_success": 0,
+        "chunks_failed": 0,
+        "nb_lignes_recues": nb_lignes,
+        "nb_lignes_analysees": 0,
+        "nb_lignes_echec": nb_lignes,
+        "error": raison,
+    }
+
+
+def _resume_etape(resultat: dict) -> dict:
+    """Conserve dans le verdict l'état d'exécution sans dupliquer les anomalies."""
+    return {cle: valeur for cle, valeur in resultat.items() if cle not in {"anomalies", "score"}}
 
 
 def pipeline_fichier(info, df: pd.DataFrame, client=None, coherence_client=None, random_state=None) -> dict:
@@ -130,31 +151,76 @@ def pipeline_fichier(info, df: pd.DataFrame, client=None, coherence_client=None,
 
     if not fichier_exploitable(anomalies_structure):
         logger.warning(f"  Anomalie critical en Structure -> arrêt, pas d'appel LLM pour {nom_fichier}")
-        verdict = analyser_judge(nom_fichier, anomalies_structure)
+        verdict = analyser_judge(nom_fichier, anomalies_structure, nb_lignes_total=len(df))
         verdict["dossier_mois"] = info.dossier_mois
-        verdict["anomalies"] = anomalies_structure
         return verdict
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futur_stats = executor.submit(analyser_stats, nom_fichier, df)
         futur_coherence = executor.submit(_analyser_coherence, info, df, anomalies_structure, coherence_client)
         anomalies_stats = futur_stats.result()
-        anomalies_coherence = futur_coherence.result()
+        resultat_coherence = futur_coherence.result()
+        anomalies_coherence = resultat_coherence.get("anomalies", [])
     logger.info(f"  Stats : {len(anomalies_stats)} anomalie(s)")
-    logger.info(f"  Cohérence : {len(anomalies_coherence)} anomalie(s)")
+    logger.info(
+        f"  Cohérence : {len(anomalies_coherence)} anomalie(s), "
+        f"statut={resultat_coherence.get('status', 'FAILED')}"
+    )
 
     lot_suspect = _lignes_suspectes(
         df, anomalies_structure + anomalies_stats + anomalies_coherence, random_state=random_state
     )
     logger.info(f"  Réalisme : {len(lot_suspect)}/{len(df)} ligne(s) envoyée(s) (suspectes + échantillon de contrôle)")
-    anomalies_realisme = analyser_realisme(nom_fichier, lot_suspect, client=client)
-    logger.info(f"  Réalisme : {len(anomalies_realisme)} anomalie(s)")
+    if lot_suspect.empty:
+        resultat_realisme = analyser_realisme(
+            nom_fichier, lot_suspect, client=client, echantillonner=False
+        )
+    elif quota_restant() <= 0:
+        resultat_realisme = _resultat_realisme_non_execute(
+            len(lot_suspect), "Réalisme non exécuté : quota LLM épuisé."
+        )
+    else:
+        # L'orchestrateur a déjà choisi le lot : aucun second sampling ne
+        # doit pouvoir supprimer une ligne explicitement suspecte.
+        resultat_realisme = analyser_realisme(
+            nom_fichier, lot_suspect, client=client, echantillonner=False
+        )
+    anomalies_realisme = resultat_realisme.get("anomalies", [])
+    logger.info(
+        f"  Réalisme : {len(anomalies_realisme)} anomalie(s), "
+        f"statut={resultat_realisme.get('status', 'FAILED')}"
+    )
 
     toutes_anomalies = anomalies_structure + anomalies_stats + anomalies_coherence + anomalies_realisme
-    verdict = analyser_judge(nom_fichier, toutes_anomalies)
+    etapes_incompletes = [
+        nom
+        for nom, resultat in (("Cohérence", resultat_coherence), ("Réalisme", resultat_realisme))
+        if resultat.get("status") != "SUCCESS"
+    ]
+    pipeline_status = "INCOMPLETE" if etapes_incompletes else "COMPLETE"
+    raisons = [
+        f"{nom} {resultat.get('status', 'FAILED')}: {resultat.get('error') or 'analyse incomplète'}"
+        for nom, resultat in (("Cohérence", resultat_coherence), ("Réalisme", resultat_realisme))
+        if resultat.get("status") != "SUCCESS"
+    ]
+    pipeline_reason = " ; ".join(raisons) or None
+
+    verdict = analyser_judge(
+        nom_fichier,
+        toutes_anomalies,
+        nb_lignes_total=len(df),
+        pipeline_status=pipeline_status,
+        pipeline_reason=pipeline_reason,
+    )
     verdict["dossier_mois"] = info.dossier_mois
-    verdict["anomalies"] = toutes_anomalies
-    logger.info(f"  Verdict : {verdict['verdict']} (score={verdict['score']}, grade={verdict['grade']})")
+    verdict["etapes_pipeline"] = {
+        "coherence": _resume_etape(resultat_coherence),
+        "realisme": _resume_etape(resultat_realisme),
+    }
+    logger.info(
+        f"  Pipeline : {pipeline_status}; verdict={verdict['verdict']} "
+        f"(score={verdict['score']}, grade={verdict['grade']})"
+    )
 
     return verdict
 
@@ -196,6 +262,12 @@ def main(noms_fichiers: list | None = None, client=None, coherence_client=None) 
     qu'un verdict ACCEPTED silencieusement faux parce que Réalisme n'a en
     réalité jamais pu être appelé.
     """
+    try:
+        construire_inventaire()
+        logger.info("Inventaire des données généré avant le lancement de l'audit")
+    except Exception as erreur:
+        logger.error(f"Échec du profiling préalable, audit maintenu : {erreur}", exc_info=True)
+
     loader = LocalLoader()
     fichiers = _fichiers_a_traiter(loader, noms_fichiers)
     logger.info(f"{len(fichiers)} fichier(s) à traiter")

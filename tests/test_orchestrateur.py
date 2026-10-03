@@ -18,6 +18,7 @@ Usage :
     python -m pytest tests/test_orchestrateur.py -v
 """
 
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +38,16 @@ NOM_FICHIER_TEST = "test.xlsx"
 def _isoler_dossiers_coherence(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_coherence_module, "DOSSIER_RESULTATS", tmp_path / "coherence")
     monkeypatch.setattr(agent_coherence_module, "DOSSIER_CHECKPOINTS", tmp_path / "coherence" / "checkpoints")
+
+    # Ces tests d'orchestration injectent des DataFrames et utilisent des
+    # chemins volontairement fictifs : simule uniquement la lecture binaire
+    # du fichier. Les tests dédiés à Cohérence couvrent le vrai SHA-256.
+    monkeypatch.setattr(
+        agent_coherence_module,
+        "calculer_hash_fichier",
+        lambda chemin: hashlib.sha256(str(chemin).encode("utf-8")).hexdigest(),
+    )
+    monkeypatch.setattr(agent_coherence_module, "PAUSE_ENTRE_CHUNKS_SECONDES", 0.0)
 
 
 @pytest.fixture(autouse=True)
@@ -225,6 +236,111 @@ def test_pipeline_fichier_ne_recharge_pas_le_fichier_pour_coherence(monkeypatch)
     assert len(coherence_client.appels) == 1
 
 
+def test_judge_recoit_nombre_lignes_et_consolide_les_deux_agents(monkeypatch):
+    monkeypatch.setattr(config, "TAUX_ECHANTILLON_CONTROLE", 0.0)
+    df = pd.DataFrame({"Version": ["A", "B", "C", "D", "E"], "Drive": ["2WD"] * 5})
+    anomalie = {
+        "fichier": NOM_FICHIER_TEST, "ligne": 3, "colonnes": ["Version", "Drive"],
+        "type": "coherence", "severite": "high", "source": "llm", "confiance": 1.0,
+        "valeur": "ALLGRIP / 2WD", "justification": "La transmission ALLGRIP contredit 2WD.",
+    }
+    coherence = _ClientFactice([({"anomalies": [anomalie]}, AppelMetadata(modele="m", succes=True))])
+    realisme = _ClientFactice([({"anomalies": [{**anomalie, "type": "realisme"}]}, AppelMetadata(modele="m", succes=True))])
+    verdict = orchestrateur.pipeline_fichier(_info(), df, client=realisme, coherence_client=coherence)
+    assert verdict["nb_lignes_total"] == 5
+    assert verdict["anomalies_total_brutes"] == 2
+    assert verdict["anomalies_uniques"] == 1
+    assert verdict["anomalies"] == verdict["anomalies_consolidees"]
+    assert verdict["anomalies"][0]["sources"] == ["coherence", "realisme"]
+    assert verdict["score"] == 88 and verdict["verdict"] == "WARNING"
+
+
+def test_quota_epuise_avant_realisme_produit_pipeline_incomplet(monkeypatch):
+    monkeypatch.setattr(config, "TAUX_ECHANTILLON_CONTROLE", 1.0)
+    monkeypatch.setattr(orchestrateur, "quota_restant", lambda: 0)
+    df = pd.DataFrame({"Modele": ["A", "B", "C"], "Prix": [10, 20, 30]})
+    coherence = _ClientFactice([({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
+
+    verdict = orchestrateur.pipeline_fichier(
+        _info(), df, client=_ClientExplosif(), coherence_client=coherence
+    )
+
+    assert verdict["pipeline_status"] == "INCOMPLETE"
+    assert verdict["verdict"] is None
+    assert verdict["score"] is None
+    assert verdict["grade"] is None
+    assert verdict["etapes_pipeline"]["coherence"]["status"] == "SUCCESS"
+    assert verdict["etapes_pipeline"]["realisme"]["status"] == "FAILED"
+    assert "quota LLM épuisé" in verdict["pipeline_reason"]
+
+
+def test_quota_epuise_pendant_coherence_remonte_partial(monkeypatch):
+    monkeypatch.setattr(config, "CHUNK_SIZE", 1)
+    monkeypatch.setattr(config, "TAUX_ECHANTILLON_CONTROLE", 0.0)
+    monkeypatch.setattr(orchestrateur, "quota_restant", lambda: 0)
+    df = pd.DataFrame({"Modele": ["A", "B", "C"], "Prix": [10, 20, 30]})
+    coherence = _ClientFactice([
+        ({"anomalies": []}, AppelMetadata(modele="m", succes=True)),
+        ({"anomalies": []}, AppelMetadata(modele="m", succes=True)),
+        (None, AppelMetadata(modele="m", succes=False, erreur="quota exhausted")),
+    ])
+
+    verdict = orchestrateur.pipeline_fichier(
+        _info(), df, client=_ClientFactice([]), coherence_client=coherence
+    )
+
+    etape = verdict["etapes_pipeline"]["coherence"]
+    assert verdict["pipeline_status"] == "INCOMPLETE"
+    assert verdict["verdict"] is None and verdict["score"] is None
+    assert etape["status"] == "PARTIAL"
+    assert etape["metadata"]["nb_chunks_succes"] == 2
+    assert etape["metadata"]["nb_chunks_echec"] == 1
+
+
+def test_orchestrateur_interdit_le_second_sampling_realisme(monkeypatch):
+    monkeypatch.setattr(config, "SEUIL_FICHIER_GEANT", 4)
+    monkeypatch.setattr(config, "MAX_LIGNES_PAR_FICHIER", 4)
+    monkeypatch.setattr(config, "TAUX_ECHANTILLON_CONTROLE", 0.0)
+    monkeypatch.setattr(orchestrateur, "quota_restant", lambda: 45)
+    df = pd.DataFrame({"A": range(10)})
+    anomalies_stats = [
+        {
+            "fichier": NOM_FICHIER_TEST,
+            "ligne": i,
+            "colonnes": ["A"],
+            "type": "statistique",
+            "severite": "low",
+            "source": "stats",
+            "valeur": str(i),
+            "justification": f"ligne suspecte {i}",
+            "confiance": 1.0,
+        }
+        for i in df.index
+    ]
+    monkeypatch.setattr(orchestrateur, "analyser_stats", lambda nom, donnees: anomalies_stats)
+    coherence = _ClientFactice([({"anomalies": []}, AppelMetadata(modele="m", succes=True))])
+    lignes_recues = []
+
+    def _realisme_factice(nom_fichier, lot, client=None, echantillonner=True):
+        lignes_recues.extend(lot.index.tolist())
+        assert echantillonner is False
+        return {
+            "anomalies": [], "status": "SUCCESS", "analyse_complete": True,
+            "chunks_total": 1, "chunks_success": 1, "chunks_failed": 0,
+            "nb_lignes_recues": len(lot), "nb_lignes_analysees": len(lot),
+            "nb_lignes_echec": 0, "error": None,
+        }
+
+    monkeypatch.setattr(orchestrateur, "analyser_realisme", _realisme_factice)
+
+    verdict = orchestrateur.pipeline_fichier(
+        _info(), df, client=_ClientFactice([]), coherence_client=coherence
+    )
+
+    assert lignes_recues == list(df.index)
+    assert verdict["pipeline_status"] == "COMPLETE"
+
+
 # ---------------------------------------------------------------------------
 # main() : garde-fou de quota et écriture des résultats
 # ---------------------------------------------------------------------------
@@ -232,6 +348,7 @@ def test_pipeline_fichier_ne_recharge_pas_le_fichier_pour_coherence(monkeypatch)
 
 def test_main_arrete_proprement_si_quota_deja_epuise(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "RESULTATS_DIR", tmp_path)
+    monkeypatch.setattr(orchestrateur, "construire_inventaire", lambda: pd.DataFrame())
     monkeypatch.setattr(orchestrateur, "quota_restant", lambda: 0)
     monkeypatch.setattr(orchestrateur.LocalLoader, "lister_fichiers", lambda self: [_info()])
     monkeypatch.setattr(
@@ -247,6 +364,7 @@ def test_main_arrete_proprement_si_quota_deja_epuise(monkeypatch, tmp_path):
 
 def test_main_traite_un_fichier_et_ecrit_les_resultats(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "RESULTATS_DIR", tmp_path)
+    monkeypatch.setattr(orchestrateur, "construire_inventaire", lambda: pd.DataFrame())
     monkeypatch.setattr(config, "TAUX_ECHANTILLON_CONTROLE", 0.0)
     monkeypatch.setattr(orchestrateur, "quota_restant", lambda: 45)
 
@@ -271,6 +389,7 @@ def test_main_traite_un_fichier_et_ecrit_les_resultats(monkeypatch, tmp_path):
 
 def test_main_ignore_un_fichier_dont_le_chargement_echoue(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "RESULTATS_DIR", tmp_path)
+    monkeypatch.setattr(orchestrateur, "construire_inventaire", lambda: pd.DataFrame())
     monkeypatch.setattr(orchestrateur, "quota_restant", lambda: 45)
     monkeypatch.setattr(orchestrateur.LocalLoader, "lister_fichiers", lambda self: [_info()])
     monkeypatch.setattr(orchestrateur.LocalLoader, "charger", lambda self, chemin: None)
@@ -282,6 +401,7 @@ def test_main_ignore_un_fichier_dont_le_chargement_echoue(monkeypatch, tmp_path)
 
 def test_main_continue_apres_lechec_dun_fichier(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "RESULTATS_DIR", tmp_path)
+    monkeypatch.setattr(orchestrateur, "construire_inventaire", lambda: pd.DataFrame())
     monkeypatch.setattr(orchestrateur, "quota_restant", lambda: 45)
 
     infos = [_info(nom="casse.xlsx"), _info(nom="ok.xlsx")]

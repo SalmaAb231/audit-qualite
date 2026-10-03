@@ -96,9 +96,9 @@ chargé — Cohérence reçoit directement ce `df` et les anomalies de structure
 déjà calculées, sans recharger le fichier ni revérifier son exploitabilité)
 → sélection des lignes suspectes (anomalies de structure + stats +
 cohérence, plus un échantillon de contrôle) → `agent_realisme` → `judge/` →
-`reporting/`, avec un garde-fou qui arrête proprement le run si le quota LLM
-quotidien est épuisé (plutôt que de produire des verdicts silencieusement
-faux). Un dossier de résultats séparé par mois d'origine
+`reporting/`. Les deux agents LLM remontent `SUCCESS`, `PARTIAL` ou `FAILED` ;
+si une étape obligatoire reste incomplète (quota ou erreur), le Judge ne
+produit ni verdict qualité ni score. Un dossier de résultats séparé par mois d'origine
 (`resultats/LOAD_LOCK_AAAAMM/`) évite toute collision entre deux fichiers de
 même nom dans des mois différents. Détails et décisions de conception dans
 [`regles_orchestrateur.md`](regles_orchestrateur.md).
@@ -163,7 +163,8 @@ python -m stats.agent_stats <fichier_ou_chemin>
   colonnes d'une même ligne** (ex. motorisation électrique avec une
   consommation en L/100km). Lit tout le fichier (échantillonné seulement
   au-delà de `config.SEUIL_FICHIER_GEANT`), gère son propre checkpoint
-  (reprise sans re-consommer de requête, `resultats/coherence/checkpoints/`)
+  versionné, identifié par chemin source relatif + SHA-256 du contenu +
+  version (`resultats/coherence/checkpoints/`)
   et sauvegarde son résultat complet dans `resultats/coherence/<fichier>.json`.
   `analyser_fichier(chemin, df=None, anomalies_structure=None)` : les deux
   derniers paramètres sont optionnels — fournis par `orchestrateur.py`

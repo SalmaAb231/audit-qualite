@@ -83,6 +83,24 @@ def test_generer_rapport_fichier_est_un_document_html_valide_minimal():
     assert "</html>" in rapport
 
 
+def test_generer_rapport_fichier_affiche_analyse_incomplete_sans_score():
+    verdict = _verdict(
+        score=None,
+        verdict=None,
+        grade=None,
+        pipeline_status="INCOMPLETE",
+        pipeline_reason="quota LLM épuisé",
+        justification="Analyse incomplète : aucun verdict qualité ni score n'est produit.",
+    )
+
+    rapport = generer_rapport_fichier(verdict, [])
+
+    assert "Analyse incomplète" in rapport
+    assert 'class="badge badge-INCOMPLETE"' in rapport
+    assert 'class="badge badge-ACCEPTED"' not in rapport
+    assert '<div class="valeur">None</div>' not in rapport
+
+
 # ---------------------------------------------------------------------------
 # generer_rapport_consolide
 # ---------------------------------------------------------------------------
@@ -180,3 +198,22 @@ def test_generer_rapport_consolide_echappe_le_html():
     fichiers = [_verdict(fichier="<img src=x onerror=alert(1)>.xlsx")]
     rapport = generer_rapport_consolide(fichiers)
     assert "<img src=x" not in rapport
+
+
+def test_generer_rapport_consolide_accepte_un_pipeline_incomplet():
+    fichiers = [
+        _verdict(
+            fichier="incomplet.xlsx",
+            score=None,
+            verdict=None,
+            grade=None,
+            pipeline_status="INCOMPLETE",
+        ),
+        _verdict(fichier="complet.xlsx", score=95, verdict="ACCEPTED"),
+    ]
+
+    rapport = generer_rapport_consolide(fichiers)
+
+    assert "Analyse incomplète" in rapport
+    assert "incomplet.xlsx" in rapport
+    assert "complet.xlsx" in rapport

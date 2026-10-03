@@ -16,7 +16,9 @@ module recompose le même résultat à partir de ses fonctions analyser() et
 fichier_exploitable(), sans dupliquer ni modifier structure/.
 """
 
+import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,13 +29,18 @@ import pandas as pd
 from loguru import logger
 
 import config
-from agents.llm_client import LLMClient
+from agents.llm_client import AppelMetadata, LLMClient
 from agents.parse_utils import valider_anomalies
 from ingestion.local_loader import LocalLoader
 from structure.agent_structure import analyser as _analyser_structure
 from structure.agent_structure import fichier_exploitable as _fichier_exploitable
 
 NOM_AGENT = "coherence"
+CHECKPOINT_VERSION = "coherence-v1"
+
+STATUT_SUCCESS = "SUCCESS"
+STATUT_PARTIAL = "PARTIAL"
+STATUT_FAILED = "FAILED"
 
 CHEMIN_PROMPT_SYSTEME = Path(__file__).resolve().parent / "prompts" / "coherence.md"
 
@@ -178,23 +185,115 @@ def _dedupliquer(anomalies: list) -> list:
 # ---------------------------------------------------------------------------
 
 
-def _chemin_checkpoint(nom_fichier: str) -> Path:
-    return DOSSIER_CHECKPOINTS / f"{nom_fichier}.json"
+TAILLE_BLOC_HASH = 8192
 
 
-def _charger_checkpoint(nom_fichier: str) -> dict:
-    chemin = _chemin_checkpoint(nom_fichier)
-    if not chemin.exists():
-        return {"chunks": {}}
+def calculer_hash_fichier(chemin: str | Path) -> str:
+    """Calcule le SHA-256 du contenu binaire réel d'un fichier local."""
+    sha256 = hashlib.sha256()
+    with Path(chemin).open("rb") as fichier:
+        for bloc in iter(lambda: fichier.read(TAILLE_BLOC_HASH), b""):
+            sha256.update(bloc)
+    return sha256.hexdigest()
+
+
+def _normaliser_source_path(source_path: str | Path) -> str:
+    """Normalise un chemin relatif ou une future clé objet."""
+    normalise = str(source_path).replace("\\", "/")
+    while normalise.startswith("./"):
+        normalise = normalise[2:]
+    return normalise
+
+
+def _chemin_relatif_source(chemin: str | Path) -> str:
+    """Retourne un chemin local stable, relatif au projet ou à la source de données."""
+    chemin_resolu = Path(chemin).resolve()
+
+    # Cas normal : conserve notamment le préfixe data/ dans l'identité.
+    racines = (config.BASE_DIR.resolve(), config.DATA_DIR.resolve().parent)
+    for racine in racines:
+        try:
+            return chemin_resolu.relative_to(racine).as_posix()
+        except ValueError:
+            continue
+
+    # Sources locales hors projet et fichiers temporaires de test : le
+    # chemin stocké reste relatif, jamais un chemin Windows absolu.
     try:
-        return json.loads(chemin.read_text(encoding="utf-8"))
-    except ValueError:
-        logger.warning(f"Checkpoint corrompu ignoré pour {nom_fichier}, redémarrage à zéro.")
-        return {"chunks": {}}
+        return _normaliser_source_path(
+            os.path.relpath(chemin_resolu, start=config.BASE_DIR.resolve())
+        )
+    except ValueError as erreur:
+        raise ValueError(
+            "Impossible de construire un chemin source relatif stable. "
+            "Fournir checkpoint_source_path explicitement."
+        ) from erreur
 
 
-def _sauvegarder_checkpoint(nom_fichier: str, checkpoint: dict) -> None:
-    chemin = _chemin_checkpoint(nom_fichier)
+def _creer_identite_checkpoint(
+    source_path: str | Path, content_hash: str, checkpoint_version: str
+) -> dict:
+    """Crée une identité agnostique au stockage, réutilisable plus tard avec S3."""
+    source_path_normalise = _normaliser_source_path(source_path)
+    checkpoint_id = hashlib.sha256(
+        f"{source_path_normalise}|{content_hash}|{checkpoint_version}".encode("utf-8")
+    ).hexdigest()
+    return {
+        "source_path": source_path_normalise,
+        "content_hash": content_hash,
+        "checkpoint_version": checkpoint_version,
+        "checkpoint_id": checkpoint_id,
+    }
+
+
+def construire_identite_checkpoint(
+    chemin: str | Path,
+    checkpoint_source_path: str | Path | None = None,
+    checkpoint_version: str | None = None,
+) -> dict:
+    """
+    Construit l'identité locale depuis le chemin source relatif, le SHA-256
+    du contenu réel et la version explicite du format/configuration.
+
+    ``checkpoint_source_path`` permettra à un futur chargeur distant de
+    fournir une clé stable (par exemple une clé S3), sans changer le format
+    de l'identité ni rendre S3 nécessaire aujourd'hui.
+    """
+    source_path = checkpoint_source_path or _chemin_relatif_source(chemin)
+    version = checkpoint_version or CHECKPOINT_VERSION
+    return _creer_identite_checkpoint(source_path, calculer_hash_fichier(chemin), version)
+
+
+def _chemin_checkpoint(checkpoint_id: str) -> Path:
+    return DOSSIER_CHECKPOINTS / f"{checkpoint_id}.json"
+
+
+def _checkpoint_vide(identite: dict) -> dict:
+    return {**identite, "chunks": {}}
+
+
+def _charger_checkpoint(identite: dict) -> dict:
+    chemin = _chemin_checkpoint(identite["checkpoint_id"])
+    if not chemin.exists():
+        return _checkpoint_vide(identite)
+    try:
+        checkpoint = json.loads(chemin.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.warning(f"Checkpoint corrompu ignoré ({chemin.name}), redémarrage à zéro.")
+        return _checkpoint_vide(identite)
+
+    if (
+        not isinstance(checkpoint, dict)
+        or not isinstance(checkpoint.get("chunks"), dict)
+        or any(checkpoint.get(cle) != valeur for cle, valeur in identite.items())
+    ):
+        logger.warning(f"Checkpoint incompatible ignoré ({chemin.name}), redémarrage à zéro.")
+        return _checkpoint_vide(identite)
+    return checkpoint
+
+
+def _sauvegarder_checkpoint(checkpoint: dict) -> None:
+    chemin = _chemin_checkpoint(checkpoint["checkpoint_id"])
     chemin.parent.mkdir(parents=True, exist_ok=True)
     chemin.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -218,7 +317,13 @@ class AgentCoherence:
         self.llm_client = llm_client or LLMClient()
         self.prompt_systeme = _charger_prompt_systeme()
 
-    def analyser_fichier(self, chemin, df: pd.DataFrame | None = None, anomalies_structure: list | None = None) -> dict:
+    def analyser_fichier(
+        self,
+        chemin,
+        df: pd.DataFrame | None = None,
+        anomalies_structure: list | None = None,
+        checkpoint_source_path: str | Path | None = None,
+    ) -> dict:
         """
         Analyse un fichier : garde d'entrée (structure), puis chunks envoyés
         au LLM. Retourne le résultat agrégé et le sauvegarde dans
@@ -235,6 +340,11 @@ class AgentCoherence:
         is True` — ce module ne revérifie pas dans ce cas. En usage
         autonome (aucun des deux fourni, ex. tests, script direct), le
         fichier est chargé et vérifié ici comme avant.
+
+        `checkpoint_source_path` est facultatif. En local, le chemin relatif
+        stable est déduit de `chemin`. Il permettra plus tard à un chargeur
+        distant de fournir directement sa clé source sans changer le format
+        des checkpoints.
         """
         chemin = Path(chemin)
         nom_fichier = chemin.name
@@ -268,13 +378,24 @@ class AgentCoherence:
             df = df_brut
 
         chunks = _decouper_en_chunks(df)
-        checkpoint = _charger_checkpoint(nom_fichier)
+        identite_checkpoint = construire_identite_checkpoint(chemin, checkpoint_source_path)
+        checkpoint = _charger_checkpoint(identite_checkpoint)
 
         for i, chunk_df in enumerate(chunks):
             cle = str(i)
-            if cle in checkpoint["chunks"]:
+            chunk_checkpoint = checkpoint["chunks"].get(cle)
+            metadata_checkpoint = (
+                chunk_checkpoint.get("metadata") if isinstance(chunk_checkpoint, dict) else None
+            )
+            if (
+                isinstance(metadata_checkpoint, dict)
+                and metadata_checkpoint.get("succes") is True
+            ):
                 logger.info(f"{nom_fichier} : chunk {i + 1}/{len(chunks)} déjà en checkpoint, aucun appel LLM.")
                 continue
+
+            if chunk_checkpoint is not None:
+                logger.info(f"{nom_fichier} : chunk {i + 1}/{len(chunks)} en échec dans le checkpoint, nouvelle tentative.")
 
             anomalies_validees, meta = self._traiter_chunk(nom_fichier, chunk_df)
             checkpoint["chunks"][cle] = {
@@ -288,9 +409,10 @@ class AgentCoherence:
                     "nb_retries": meta.nb_retries,
                     "succes": meta.succes,
                     "depuis_cache": meta.depuis_cache,
+                    "erreur": meta.erreur,
                 },
             }
-            _sauvegarder_checkpoint(nom_fichier, checkpoint)
+            _sauvegarder_checkpoint(checkpoint)
             if not meta.succes:
                 logger.error(
                     f"{nom_fichier} : chunk {i + 1}/{len(chunks)} EN ÉCHEC TOTAL "
@@ -311,14 +433,22 @@ class AgentCoherence:
 
     def _traiter_chunk(self, nom_fichier: str, chunk_df):
         prompt_utilisateur = _construire_prompt_utilisateur(nom_fichier, chunk_df)
-        reponse, meta = self.llm_client.appeler(
-            system_prompt=self.prompt_systeme,
-            user_prompt=prompt_utilisateur,
-            model=config.MODELES[NOM_AGENT],
-            temperature=config.TEMPERATURES[NOM_AGENT],
-            max_tokens=config.MAX_TOKENS[NOM_AGENT],
-            json_attendu=True,
-        )
+        try:
+            reponse, meta = self.llm_client.appeler(
+                system_prompt=self.prompt_systeme,
+                user_prompt=prompt_utilisateur,
+                model=config.MODELES[NOM_AGENT],
+                temperature=config.TEMPERATURES[NOM_AGENT],
+                max_tokens=config.MAX_TOKENS[NOM_AGENT],
+                json_attendu=True,
+            )
+        except Exception as erreur:
+            reponse = None
+            meta = AppelMetadata(
+                modele="indisponible",
+                succes=False,
+                erreur=f"exception pendant l'appel LLM : {erreur}",
+            )
 
         anomalies_brutes = _extraire_liste_anomalies(reponse)
         for anomalie in anomalies_brutes:
@@ -333,6 +463,9 @@ class AgentCoherence:
             "fichier": nom_fichier,
             "exploitable": False,
             "motif_rejet": motif_rejet,
+            "status": STATUT_FAILED,
+            "analyse_complete": False,
+            "error": motif_rejet,
             "score": 0.0,
             "nb_lignes_analysees": 0,
             "nb_lignes_totales": nb_lignes_totales,
@@ -342,6 +475,7 @@ class AgentCoherence:
                 "tokens_total": 0,
                 "duree_totale": 0.0,
                 "nb_chunks": 0,
+                "nb_chunks_succes": 0,
                 "nb_chunks_echec": 0,
                 "nb_lignes_echec": 0,
                 "nb_retries": 0,
@@ -358,6 +492,7 @@ class AgentCoherence:
         nb_retries_total = 0
         nb_chunks_echec = 0
         nb_lignes_echec = 0
+        erreurs = []
 
         for cle in sorted(checkpoint["chunks"], key=int):
             info_chunk = checkpoint["chunks"][cle]
@@ -373,6 +508,8 @@ class AgentCoherence:
                 # "propres" dans le score ni dans nb_lignes_analysees.
                 nb_chunks_echec += 1
                 nb_lignes_echec += info_chunk.get("nb_lignes", 0)
+                if meta.get("erreur"):
+                    erreurs.append(str(meta["erreur"]))
                 continue
 
             toutes_anomalies.extend(info_chunk["anomalies"])
@@ -389,10 +526,21 @@ class AgentCoherence:
         score = 1.0 - (somme_ponderations / nb_lignes_reellement_analysees) if nb_lignes_reellement_analysees else 0.0
         score = max(0.0, min(1.0, score))
 
+        nb_chunks_succes = max(0, nb_chunks - nb_chunks_echec)
+        if nb_chunks_echec == 0:
+            status = STATUT_SUCCESS
+        elif nb_chunks_succes == 0:
+            status = STATUT_FAILED
+        else:
+            status = STATUT_PARTIAL
+
         return {
             "fichier": nom_fichier,
             "exploitable": True,
             "motif_rejet": None,
+            "status": status,
+            "analyse_complete": status == STATUT_SUCCESS,
+            "error": " ; ".join(dict.fromkeys(erreurs)) or None,
             "score": round(score, 4),
             "nb_lignes_analysees": nb_lignes_reellement_analysees,
             "nb_lignes_totales": nb_lignes_totales,
@@ -402,6 +550,7 @@ class AgentCoherence:
                 "tokens_total": tokens_total,
                 "duree_totale": round(duree_totale, 2),
                 "nb_chunks": nb_chunks,
+                "nb_chunks_succes": nb_chunks_succes,
                 "nb_chunks_echec": nb_chunks_echec,
                 "nb_lignes_echec": nb_lignes_echec,
                 "nb_retries": nb_retries_total,
