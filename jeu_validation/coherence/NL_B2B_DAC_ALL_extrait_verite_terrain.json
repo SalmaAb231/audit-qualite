@@ -1,0 +1,30 @@
+[
+  {
+    "ligne": 10,
+    "colonnes": [
+      "Seats"
+    ],
+    "axe": "axe4_capacites_physiques_vs_modele",
+    "description": "La Dacia SPRING est une citadine électrique 4 places : jamais commercialisée en version 7 places.",
+    "valeurs_avant": {
+      "Seats": "4 zitplaatsen"
+    },
+    "valeurs_injectees": {
+      "Seats": "7 zitplaatsen"
+    }
+  },
+  {
+    "ligne": 44,
+    "colonnes": [
+      "Rental"
+    ],
+    "axe": "axe2_prix_vs_categorie_modele",
+    "description": "Un loyer de 15 €/mois pour un SUV familial (BIGSTER, finition 'expression') est implausible pour ce segment.",
+    "valeurs_avant": {
+      "Rental": "521"
+    },
+    "valeurs_injectees": {
+      "Rental": "15"
+    }
+  }
+]

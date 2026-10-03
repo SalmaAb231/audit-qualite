@@ -1,0 +1,35 @@
+# Secrets et configuration locale
+.env
+.env.*
+!.env.example
+
+# Données (peuvent être volumineuses et confidentielles)
+data/
+# Cache local des fichiers téléchargés depuis S3 (déjà couvert par data/ ci-dessus,
+# explicite au cas où DATA_DIR pointerait ailleurs)
+data/cache/
+
+# Résultats générés
+resultats/
+
+# Cache des réponses LLM (agents/llm_client.py) et compteur de quota :
+# état d'exécution local, rejouable, pas à versionner
+cache_llm/
+
+# Logs d'exécution
+*.log
+
+# Fichiers Excel isolés à la racine (au cas où)
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.pytest_tmp*/
+.venv/
+venv/
+
+# Environnements / IDE
+.vscode/
+.idea/
