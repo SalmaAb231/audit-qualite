@@ -141,3 +141,4 @@ Pour considérer un fichier complètement audité, vérifier simultanément :
 - `etapes_pipeline.coherence.status == "SUCCESS"` ;
 - `etapes_pipeline.realisme.status == "SUCCESS"` ;
 - `nb_lignes_echec == 0` pour les deux étapes LLM.
+

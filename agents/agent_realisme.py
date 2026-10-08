@@ -203,7 +203,12 @@ def _construire_prompt_verification_utilisateur(anomalies: list, resultats_reche
     return "\n\n".join(blocs)
 
 
-def _verifier_avec_recherche_web(nom_fichier: str, anomalies: list, client: LLMClient) -> list:
+def _verifier_avec_recherche_web(
+    nom_fichier: str,
+    anomalies: list,
+    client: LLMClient,
+    attempt_budget: int | None = None,
+) -> list:
     """
     Deuxième passe, un seul appel LLM pour tout le chunk (pas un par
     anomalie) : confronte chaque anomalie candidate à un extrait de
@@ -214,6 +219,12 @@ def _verifier_avec_recherche_web(nom_fichier: str, anomalies: list, client: LLMC
     config.RECHERCHE_WEB_ACTIVEE. Voir agents/regles_realisme.md.
     """
     if not config.RECHERCHE_WEB_ACTIVEE:
+        return anomalies
+    if attempt_budget is not None and attempt_budget <= 0:
+        logger.warning(
+            f"{nom_fichier} : budget LLM du chunk épuisé, "
+            "anomalies conservées sans seconde passe web."
+        )
         return anomalies
 
     resultats_recherche = []
@@ -233,6 +244,7 @@ def _verifier_avec_recherche_web(nom_fichier: str, anomalies: list, client: LLMC
             temperature=config.TEMPERATURES["realisme"],
             max_tokens=config.MAX_TOKENS["realisme"],
             json_attendu=True,
+            attempt_budget=attempt_budget,
         )
     except Exception as erreur:
         logger.warning(f"{nom_fichier} : appel de vérification web échoué ({erreur}), anomalies conservées telles quelles.")
@@ -303,11 +315,21 @@ def _analyser_chunk(nom_fichier: str, chunk: pd.DataFrame, client: LLMClient, nu
             "nb_lignes": len(chunk),
         }
 
-    anomalies_brutes = []
-    if isinstance(reponse, dict):
-        anomalies_brutes = reponse.get("anomalies", [])
+    if isinstance(reponse, dict) and isinstance(reponse.get("anomalies"), list):
+        anomalies_brutes = reponse["anomalies"]
     elif isinstance(reponse, list):
         anomalies_brutes = reponse
+    else:
+        logger.warning(
+            f"{nom_fichier} chunk {num_chunk}/{nb_chunks} : "
+            "JSON métier invalide (liste 'anomalies' absente ou invalide)."
+        )
+        return {
+            "anomalies": [],
+            "succes": False,
+            "error": "réponse JSON métier invalide pour l'agent Réalisme",
+            "nb_lignes": len(chunk),
+        }
 
     anomalies_validees = valider_anomalies(anomalies_brutes)
     for anomalie in anomalies_validees:
@@ -316,7 +338,16 @@ def _analyser_chunk(nom_fichier: str, chunk: pd.DataFrame, client: LLMClient, nu
         anomalie["source"] = SOURCE_ANOMALIE
 
     if anomalies_validees:
-        anomalies_validees = _verifier_avec_recherche_web(nom_fichier, anomalies_validees, client)
+        budget_restant = max(
+            0,
+            int(config.MAX_LLM_ATTEMPTS_PER_CHUNK) - int(metadata.nb_tentatives or 0),
+        )
+        anomalies_validees = _verifier_avec_recherche_web(
+            nom_fichier,
+            anomalies_validees,
+            client,
+            attempt_budget=budget_restant,
+        )
 
     logger.info(
         f"{nom_fichier} chunk {num_chunk}/{nb_chunks} : {len(anomalies_validees)} anomalie(s) "

@@ -1,0 +1,6 @@
+[client]
+showSidebarNavigation = false
+toolbarMode = "minimal"
+
+[theme]
+primaryColor = "#2563EB"

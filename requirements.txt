@@ -10,3 +10,5 @@ langdetect
 tabulate
 pytest
 ddgs
+streamlit
+plotly

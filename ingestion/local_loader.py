@@ -37,6 +37,31 @@ class LocalLoader:
 
     def __init__(self, data_dir: Path = DATA_DIR):
         self.data_dir = Path(data_dir)
+        self._source_metadata: dict[str, dict] = {}
+
+    def source_metadata(self, chemin: Path) -> dict:
+        """Retourne le sidecar technique du dernier chargement, jamais le DataFrame."""
+        return dict(self._source_metadata.get(str(Path(chemin).resolve()), {}))
+
+    def _remember_source_metadata(
+        self,
+        chemin: Path,
+        df: pd.DataFrame,
+        *,
+        sheet_name: str | None,
+    ) -> None:
+        index_exact = (
+            isinstance(df.index, pd.RangeIndex)
+            and df.index.start == 0
+            and df.index.step == 1
+        )
+        self._source_metadata[str(Path(chemin).resolve())] = {
+            "sheet_name": sheet_name,
+            "columns_in_source_order": [str(column) for column in df.columns],
+            "row_count": len(df),
+            "header_rows": 1,
+            "row_mapping_status": "exact" if index_exact else "unavailable",
+        }
 
     def lister_fichiers(self) -> list[FichierInfo]:
         """
@@ -90,13 +115,18 @@ class LocalLoader:
 
         try:
             if extension in (".xlsx", ".xls"):
-                return pd.read_excel(chemin)
+                with pd.ExcelFile(chemin) as workbook:
+                    sheet_name = workbook.sheet_names[0] if workbook.sheet_names else None
+                    df = pd.read_excel(workbook, sheet_name=0)
             elif extension == ".csv":
                 # Tentative avec séparateur auto-détecté, encodage UTF-8 par défaut
-                return pd.read_csv(chemin, sep=None, engine="python", encoding="utf-8")
+                df = pd.read_csv(chemin, sep=None, engine="python", encoding="utf-8")
+                sheet_name = None
             else:
                 logger.warning(f"Extension non prise en charge : {chemin}")
                 return None
+            self._remember_source_metadata(chemin, df, sheet_name=sheet_name)
+            return df
         except Exception as erreur:
             logger.error(f"Échec du chargement de {chemin.name} : {erreur}")
             return None

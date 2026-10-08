@@ -15,9 +15,19 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from loguru import logger
 
 # Charge les variables du fichier .env s'il existe (ignoré silencieusement sinon)
 load_dotenv()
+
+# Mode de stockage utilisé par l'orchestrateur : fichiers locaux ou objets S3.
+STORAGE_MODE = os.getenv("STORAGE_MODE", "local").lower()
+if STORAGE_MODE not in {"local", "s3"}:
+    logger.warning(
+        f"STORAGE_MODE invalide ({STORAGE_MODE!r}) : valeurs acceptées = 'local' ou 's3'. "
+        "Utilisation du mode local par défaut."
+    )
+    STORAGE_MODE = "local"
 
 # Racine du projet (dossier contenant ce fichier)
 BASE_DIR = Path(__file__).resolve().parent
@@ -35,6 +45,9 @@ EXTENSIONS_SUPPORTEES = (".xlsx", ".xls", ".csv")
 # Dossier de sortie des résultats (inventaire, anomalies, rapports, etc.)
 RESULTATS_DIR = BASE_DIR / "resultats"
 
+# Un fichier JSON immuable par exécution, consommable par le futur dashboard
+HISTORY_DIR = RESULTATS_DIR / "history"
+
 # ---------------------------------------------------------------------------
 # AWS / S3 (utilisé uniquement au déploiement ; sans effet en local, où
 # ingestion/local_loader.py est utilisé à la place de ingestion/s3_client.py)
@@ -47,8 +60,16 @@ S3_BUCKET = os.getenv("S3_BUCKET", "")
 
 # Préfixe où sont déposés les fichiers de données à auditer
 S3_INPUT_PREFIX = os.getenv("S3_INPUT_PREFIX", "input/")
-# Préfixe où seront déposés les rapports générés (module reporting/, à venir)
+# Préfixe où sont déposés les rapports générés en mode S3
 S3_REPORTS_PREFIX = os.getenv("S3_REPORTS_PREFIX", "reports/")
+# Préfixe où sont copiés les fichiers rejetés ou non validés
+S3_QUARANTINE_PREFIX = os.getenv("S3_QUARANTINE_PREFIX", "quarantine/")
+# Préfixe de l'historique immuable des exécutions
+S3_HISTORY_PREFIX = os.getenv("S3_HISTORY_PREFIX", "history/")
+
+# Durée du cache de lecture des artefacts du dashboard. Les rapports HTML,
+# verdicts JSON et sources ne sont lus qu'après une action utilisateur.
+ARTIFACT_CACHE_TTL_SECONDS = int(os.getenv("ARTIFACT_CACHE_TTL_SECONDS", "900"))
 
 # Dossier de cache local des fichiers téléchargés depuis S3
 # (voir ingestion/s3_client.py)
@@ -84,7 +105,7 @@ MODELES = {
     "realisme": [
         "nvidia/nemotron-3-ultra-550b-a55b:free",
         "google/gemma-4-31b-it:free",        # supporte les tools aussi
-        "openai/gpt-oss-20b:free",           # si encore présent au catalogue
+        "google/gemma-4-26b-a4b-it:free",    # gratuit, contexte 262K, sorties structurées
     ],
 
     # Tâche simple (justification du verdict, quelques phrases) → modèle léger
@@ -155,16 +176,26 @@ RATE_LIMIT = {
     "backoff_initial": 5.0,      # secondes d'attente au 1er retry, doublée ensuite
 }
 
+# Budget FREE tier global pour une opération LLM logique (un chunk). Ce
+# plafond inclut les retries et les changements de modèle, fallback compris.
+MAX_LLM_ATTEMPTS_PER_CHUNK = 4
+
+# Circuit breaker mémoire/process : après deux réponses 429 explicitement
+# attribuées au provider upstream, le modèle est ignoré pendant cinq minutes.
+OPENROUTER_CIRCUIT_BREAKER_THRESHOLD = 2
+OPENROUTER_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 300
+FREE_TIER_RETRY_BACKOFF_SECONDS = 2.0
+
 # Cache des réponses LLM : chaque appel est sauvegardé (hash du prompt →
 # réponse) ; un prompt identique est servi depuis le cache SANS consommer
 # de requête. Essentiel avec 50 requêtes/jour : le débogage du parsing ou
 # du scoring se fait en rejouant le cache, jamais en rappelant l'API.
 CACHE_LLM_DIR = BASE_DIR / "cache_llm"
 
-# Compteur de requêtes quotidien persistant (JSON : {"date": ..., "compteur": N}).
-# llm_client.py incrémente à chaque appel réel et BLOQUE proprement à
-# max_requetes_jour avec un message clair.
-COMPTEUR_REQUETES_FICHIER = CACHE_LLM_DIR / "compteur_quotidien.json"
+# Compteurs quotidiens locaux isolés par clé OpenRouter. llm_client.py dérive
+# le nom du fichier depuis un fingerprint SHA-256 de la clé réellement utilisée ;
+# config.py ne construit aucun chemin à partir du secret lui-même.
+QUOTA_LLM_DIR = CACHE_LLM_DIR / "quota"
 
 # ---------------------------------------------------------------------------
 # Découpage des données envoyées aux agents LLM

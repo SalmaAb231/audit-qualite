@@ -1,8 +1,11 @@
 """
 Script d'inventaire des fichiers de données.
 
-Parcourt tous les fichiers trouvés dans DATA_DIR via LocalLoader, charge
-chacun d'eux et produit un inventaire (resultats/inventaire.csv) contenant,
+Par défaut, parcourt les fichiers trouvés dans DATA_DIR via LocalLoader. Un
+appelant peut aussi fournir son loader actif et une sélection déjà filtrée,
+notamment pour inventorier uniquement les objets concernés par un audit S3.
+Le module charge chacun des fichiers retenus et produit un inventaire
+(resultats/inventaire.csv) contenant,
 pour chaque fichier : son nom, son mois d'origine, sa taille, son nombre de
 lignes/colonnes, la liste de ses colonnes, une estimation heuristique de la
 langue utilisée, et l'éventuelle erreur de lecture rencontrée.
@@ -114,10 +117,14 @@ def detecter_langue(colonnes: list, df: pd.DataFrame | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def construire_inventaire() -> pd.DataFrame:
-    """Parcourt tous les fichiers de données et construit l'inventaire ligne par ligne."""
-    loader = LocalLoader()
-    fichiers = loader.lister_fichiers()
+def construire_inventaire(loader=None, fichiers: list | None = None) -> pd.DataFrame:
+    """Construit l'inventaire depuis le loader et le périmètre fournis."""
+    if loader is None:
+        loader = LocalLoader()
+    if fichiers is None:
+        fichiers = loader.lister_fichiers()
+    else:
+        fichiers = list(fichiers)
 
     if not fichiers:
         logger.warning("Aucun fichier de données trouvé, l'inventaire sera vide.")
