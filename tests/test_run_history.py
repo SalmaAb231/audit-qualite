@@ -135,7 +135,34 @@ def test_entree_fichier_reference_les_resultats_et_serialise_path():
     assert entree["verdict_json"].endswith("verdict_rejected.json")
     assert entree["quarantine_key"] == "quarantine/LOAD_LOCK_202603/rejected.xlsx"
     assert entree["decision_reason"] == "Reason for rejected.xlsx"
+    assert entree["artifacts"]["report_html"] == entree["report_html"]
+    assert entree["artifacts"]["verdict_json"] == entree["verdict_json"]
+    assert entree["artifacts"]["anomalies_json"] is None
+    assert "anomalies" not in entree
     json.dumps(entree, ensure_ascii=False)
+
+
+def test_document_run_stocke_la_reference_du_rapport_consolide_sans_casser_legacy():
+    document = construire_document_run(
+        run_id="run-versioned",
+        started_at_utc=DEBUT,
+        finished_at_utc=FIN,
+        storage_mode="s3",
+        files_discovered=0,
+        files=[],
+        artifacts={"consolidated_report_html": "reports/runs/run-versioned/rapport_consolide.html"},
+    )
+    legacy = construire_document_run(
+        run_id="run-legacy",
+        started_at_utc=DEBUT,
+        finished_at_utc=FIN,
+        storage_mode="local",
+        files_discovered=0,
+        files=[],
+    )
+
+    assert document["artifacts"]["consolidated_report_html"].startswith("reports/runs/run-versioned/")
+    assert "artifacts" not in legacy
 
 
 def test_entree_fichier_normalise_uniquement_les_alias_agents_connus():

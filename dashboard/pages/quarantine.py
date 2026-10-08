@@ -12,8 +12,10 @@ from dashboard.components import (
     format_short_reason,
     format_user_reason,
     render_empty_state,
+    render_artifact_access,
     render_info_grid,
     render_page_header,
+    style_status_columns,
 )
 from dashboard.transformations import quarantine_metrics
 
@@ -80,7 +82,11 @@ def render(files_df: pd.DataFrame, agents_df: pd.DataFrame | None = None) -> Non
         (name for name in ("quarantine_key", "quarantine_s3_key") if name in quarantined),
         None,
     )
-    st.dataframe(visible, hide_index=True, use_container_width=True)
+    st.dataframe(
+        style_status_columns(visible, ["Pipeline Status", "Judge Verdict"]),
+        hide_index=True,
+        use_container_width=True,
+    )
 
     st.subheader("Quarantine Event Details")
     selected = st.selectbox(
@@ -95,7 +101,9 @@ def render(files_df: pd.DataFrame, agents_df: pd.DataFrame | None = None) -> Non
     reason_value = record.get("decision_reason")
     if pd.isna(reason_value) or not str(reason_value).strip():
         reason_value = record.get("quarantine_reason")
-    summary_tab, agents_tab, technical_tab = st.tabs(["Summary", "Agent Results", "Technical Details"])
+    summary_tab, artifacts_tab, agents_tab, technical_tab = st.tabs(
+        ["Summary", "Artifacts", "Agent Results", "Technical Details"]
+    )
     with summary_tab:
         render_info_grid(
             [
@@ -114,6 +122,38 @@ def render(files_df: pd.DataFrame, agents_df: pd.DataFrame | None = None) -> Non
                 ("Quarantine object", display_value(record.get(key_column)) if key_column else "N/A"),
             ]
         )
+    with artifacts_tab:
+        source_column, quarantine_column, report_column = st.columns(3)
+        with source_column:
+            render_artifact_access(
+                "Original source",
+                record.get("source"),
+                mime_type="application/octet-stream",
+                download_label="Download original source",
+                storage_mode=record.get("storage_mode") or "local",
+                key=f"quarantine_source_{record.get('run_id')}_{selected}",
+            )
+        with quarantine_column:
+            render_artifact_access(
+                "Quarantine copy",
+                record.get(key_column) if key_column else None,
+                mime_type="application/octet-stream",
+                download_label="Download quarantine copy",
+                storage_mode=record.get("storage_mode") or "local",
+                key=f"quarantine_copy_{record.get('run_id')}_{selected}",
+            )
+        with report_column:
+            render_artifact_access(
+                "Associated audit report",
+                record.get("report_html"),
+                mime_type="text/html",
+                download_label="Download audit report",
+                storage_mode=record.get("storage_mode") or "local",
+                artifact_kind="html",
+                action_label="View audit report",
+                key=f"quarantine_report_{record.get('run_id')}_{selected}",
+                expected_run_id=record.get("run_id"),
+            )
     with agents_tab:
         if agents_df.empty:
             st.info("Agent execution metadata is not available for this historical event.")
@@ -128,7 +168,11 @@ def render(files_df: pd.DataFrame, agents_df: pd.DataFrame | None = None) -> Non
             else:
                 client_agent_records = agent_records[["agent", "status", "count"]].copy()
                 client_agent_records.columns = ["Agent", "Status", "Detections"]
-                st.dataframe(client_agent_records, hide_index=True, use_container_width=True)
+                st.dataframe(
+                    style_status_columns(client_agent_records, ["Status"]),
+                    hide_index=True,
+                    use_container_width=True,
+                )
     with technical_tab:
         st.dataframe(
             pd.DataFrame(

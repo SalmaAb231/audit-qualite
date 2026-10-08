@@ -208,6 +208,10 @@ class S3Loader:
         """Retourne le chemin local du cache correspondant à une clé S3."""
         return config.CACHE_DIR / str(cle)
 
+    def source_metadata(self, cle: str) -> dict:
+        """Expose le sidecar du fichier en cache sans ajouter de colonne métier."""
+        return self._loader_local.source_metadata(self.chemin_cache(cle))
+
     def charger(self, cle: str) -> pd.DataFrame | None:
         """
         Télécharge (si nécessaire) puis charge un fichier S3 dans un DataFrame.

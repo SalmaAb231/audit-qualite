@@ -126,6 +126,15 @@ def construire_entree_fichier(
 ) -> dict:
     """Extrait uniquement les données finales utiles au dashboard."""
     anomalies = _anomalies_consolidees(verdict)
+    references = {
+        "report_html": report_html,
+        "verdict_json": verdict_json,
+        # Les anomalies détaillées sont incluses dans verdict_json : aucun
+        # second artefact volumineux n'est créé ni dupliqué dans history.
+        "anomalies_json": None,
+        "source": source,
+        "quarantine": quarantine_key if quarantined else None,
+    }
     return _json_compatible(
         {
             "filename": filename,
@@ -146,6 +155,14 @@ def construire_entree_fichier(
             "report_html": report_html,
             "verdict_json": verdict_json,
             "quarantine_key": quarantine_key if quarantined else None,
+            "artifacts": references,
+            "anomaly_details": {
+                "storage": "verdict_json" if verdict_json else None,
+                "count": len(anomalies),
+                "traceability_schema_version": (verdict.get("traceability") or {}).get("schema_version")
+                if isinstance(verdict.get("traceability"), dict)
+                else None,
+            },
         }
     )
 
@@ -174,6 +191,7 @@ def construire_document_run(
     storage_mode: str,
     files_discovered: int,
     files: list,
+    artifacts: dict | None = None,
 ) -> dict:
     """Agrège les fichiers traités en un document historique versionné."""
     fichiers = [_json_compatible(fichier) for fichier in files]
@@ -192,7 +210,7 @@ def construire_document_run(
         "anomalies_by_severity": _additionner_compteurs(fichiers, "anomalies_by_severity", SEVERITES),
     }
     duree = max(0.0, (_en_utc(finished_at_utc) - _en_utc(started_at_utc)).total_seconds())
-    return {
+    document = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "started_at_utc": _iso_utc(started_at_utc),
@@ -202,6 +220,9 @@ def construire_document_run(
         "summary": summary,
         "files": fichiers,
     }
+    if artifacts:
+        document["artifacts"] = _json_compatible(artifacts)
+    return document
 
 
 def chemin_historique_local(history_dir: Path, started_at_utc: datetime, run_id: str) -> Path:

@@ -1,6 +1,9 @@
 import pandas as pd
 import inspect
+from pathlib import Path
+from types import SimpleNamespace
 
+from dashboard import charts, components
 from dashboard.components import (
     active_filter_labels,
     estimate_chunk_count,
@@ -10,6 +13,7 @@ from dashboard.components import (
     format_user_reason,
     format_duration,
     format_optional_number,
+    render_artifact_access,
     render_audit_configuration,
     render_global_filters,
     render_sidebar_environment,
@@ -29,8 +33,10 @@ from dashboard.transformations import (
     derive_run_status,
     display_columns,
     filtered_view_counts,
+    filter_runs_by_view,
     historical_detections_by_file,
     latest_anomalies_by_file,
+    unique_file_identity_count,
     time_series_state,
     utc_timeline_data,
 )
@@ -300,6 +306,69 @@ def test_three_repeated_audits_are_117_cumulative_and_39_latest():
     assert latest_anomalies_by_file(frame).loc["repeat.xlsx"] == 39
 
 
+def test_unique_files_impacted_uses_source_then_load_lock_filename_identity():
+    frame = pd.DataFrame(
+        [
+            {"source": "s3://bucket/a.xlsx", "filename": "a.xlsx", "load_lock": "L1", "anomalies_total": 3},
+            {"source": "s3://bucket/a.xlsx", "filename": "a.xlsx", "load_lock": "L1", "anomalies_total": 2},
+            {"source": None, "filename": "b.xlsx", "load_lock": "L2", "anomalies_total": 1},
+            {"source": None, "filename": "clean.xlsx", "load_lock": "L3", "anomalies_total": 0},
+        ]
+    )
+    assert unique_file_identity_count(frame, impacted_only=True) == 2
+
+
+def test_audit_chart_uses_independent_markers_and_business_colors():
+    frame = pd.DataFrame(
+        [
+            {
+                "timestamp": f"2026-10-08T1{index}:00:00Z",
+                "filename": f"file-{index}.xlsx",
+                "load_lock": "LOAD_LOCK_1",
+                "anomalies_total": index + 1,
+                "pipeline_status": "INCOMPLETE" if outcome == "INCOMPLETE" else "COMPLETE",
+                "verdict": None if outcome == "INCOMPLETE" else outcome,
+                "status": outcome,
+                "score": None if outcome == "INCOMPLETE" else 80 + index,
+            }
+            for index, outcome in enumerate(("ACCEPTED", "WARNING", "REJECTED", "INCOMPLETE"))
+        ]
+    )
+    figure = charts.anomalies_per_audit(frame)
+    assert all(trace.mode == "markers" for trace in figure.data)
+    colors = {trace.name.upper(): trace.marker.color for trace in figure.data}
+    assert colors == charts.OUTCOME_COLORS
+
+
+def test_agent_audit_chart_does_not_connect_different_files():
+    points = pd.DataFrame(
+        [
+            {
+                "audit_time": "2026-10-08T10:00:00Z",
+                "agent": "Structure",
+                "detections": 3,
+                "filename": "a.xlsx",
+                "load_lock": "L1",
+                "agent_status": "SUCCESS",
+                "pipeline_status": "COMPLETE",
+                "verdict": "ACCEPTED",
+            },
+            {
+                "audit_time": "2026-10-08T11:00:00Z",
+                "agent": "Structure",
+                "detections": 8,
+                "filename": "b.xlsx",
+                "load_lock": "L2",
+                "agent_status": "SUCCESS",
+                "pipeline_status": "COMPLETE",
+                "verdict": "WARNING",
+            },
+        ]
+    )
+    figure = charts.agent_detections_by_audit(points)
+    assert all(trace.mode == "markers" for trace in figure.data)
+
+
 def test_latest_file_values_use_load_lock_as_part_of_fallback_identity():
     frame = pd.DataFrame(
         [
@@ -339,6 +408,21 @@ def test_quarantine_events_and_unique_files_are_distinct():
         ]
     )
     assert quarantine.quarantine_history_counts(frame) == (2, 1, 3)
+
+
+def test_runs_view_filter_never_removes_persisted_rows():
+    frame = pd.DataFrame(
+        [
+            {"run_id": "processed", "files_processed": 2},
+            {"run_id": "empty", "files_processed": 0},
+            {"run_id": "unknown", "files_processed": None},
+        ]
+    )
+    processed = filter_runs_by_view(frame, "Processed runs")
+    restored = filter_runs_by_view(frame, "All runs")
+    assert processed["run_id"].tolist() == ["processed"]
+    assert restored["run_id"].tolist() == ["processed", "empty", "unknown"]
+    assert len(frame) == 3
 
 
 def test_llm_call_estimate_and_active_filter_labels():
@@ -444,6 +528,23 @@ def test_realism_success_rate_is_50_percent_for_one_success_and_one_failure():
     assert metrics["status"] == "FAILED"
 
 
+def test_unknown_and_not_run_are_excluded_from_agent_success_rate():
+    frame = pd.DataFrame(
+        [
+            {"agent": "structure", "status": "SUCCESS", "count": 1, "timestamp": "2026-10-08T10:00:00Z"},
+            {"agent": "structure", "status": "FAILED", "count": None, "timestamp": "2026-10-08T11:00:00Z"},
+            {"agent": "structure", "status": "NOT_RUN", "count": None, "timestamp": "2026-10-08T12:00:00Z"},
+            {"agent": "structure", "status": "UNKNOWN", "count": None, "timestamp": "2026-10-08T13:00:00Z"},
+        ]
+    )
+    metrics = agents.agent_coverage_metrics(frame)["structure"]
+    assert metrics["success_rate"] == 50
+    assert metrics["successful"] == 1
+    assert metrics["failed"] == 1
+    assert metrics["not_run"] == 1
+    assert metrics["unknown"] == 1
+
+
 def test_quota_risk_is_computed_locally_from_estimate_and_remaining_allowance():
     assert quota_risk_level(4, 13) == "LOW"
     assert quota_risk_level(8, 13) == "MEDIUM"
@@ -455,6 +556,32 @@ def test_filter_chips_use_neutral_indigo_style():
     selector = '[data-testid="stSidebar"] [data-baseweb="tag"]'
     assert selector in CSS
     assert "#e8edff" in CSS
+
+
+def test_primary_action_and_responsive_kpi_styles_are_present():
+    assert 'button[kind="primary"]' in CSS
+    assert "background: var(--dq-blue)" in CSS
+    assert ".metric-grid" in CSS
+    assert "repeat(3, minmax(0, 1fr))" in CSS
+
+
+def test_missing_artifact_never_renders_a_download_button(monkeypatch):
+    downloads = []
+    monkeypatch.setattr(components.st, "markdown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(components.st, "caption", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        components.st,
+        "download_button",
+        lambda *args, **kwargs: downloads.append((args, kwargs)),
+    )
+    shown = render_artifact_access(
+        "Report",
+        None,
+        mime_type="text/html",
+        download_label="Download report",
+    )
+    assert shown is False
+    assert downloads == []
 
 
 def test_app_component_contract_remains_importable():
@@ -530,3 +657,29 @@ def test_analytics_pages_do_not_invoke_an_llm_client_on_render():
         source = inspect.getsource(module)
         assert "LLMClient(" not in source
         assert ".appeler(" not in source
+        assert "S3Loader(" not in source
+        assert "executer_audit(" not in source
+
+
+def test_navigation_contract_and_secret_names_stay_out_of_client_pages():
+    app_source = (Path(__file__).parents[1] / "dashboard" / "app.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'pages = ["Overview", "New Audit", "Files", "Anomalies", "Agents", "Quarantine", "Runs"]' in app_source
+    client_source = "\n".join(
+        inspect.getsource(module) for module in (overview, files, anomalies, agents, quarantine, runs)
+    )
+    assert "AWS_SECRET_ACCESS_KEY" not in client_source
+    assert "OPENROUTER_API_KEY" not in client_source
+
+
+def test_anomaly_explorer_uses_a_pre_render_navigation_callback(monkeypatch):
+    session_state = SimpleNamespace(navigation="Files")
+    monkeypatch.setattr(files, "st", SimpleNamespace(session_state=session_state))
+
+    files._open_anomaly_explorer()
+
+    assert session_state.navigation == "Anomalies"
+    render_source = inspect.getsource(files.render)
+    assert "on_click=_open_anomaly_explorer" in render_source
+    assert "st.session_state.navigation" not in render_source

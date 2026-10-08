@@ -9,10 +9,10 @@ RUN_COLUMNS = [
     "run_id", "started_at", "finished_at", "duration_seconds", "storage_mode",
     "files_discovered", "files_processed", "accepted", "warning", "rejected",
     "incomplete", "quarantined", "average_score", "total_anomalies",
-    "run_status", "stop_reason",
+    "run_status", "stop_reason", "consolidated_report_html",
 ]
 FILE_COLUMNS = [
-    "run_id", "timestamp", "filename", "load_lock", "source", "pipeline_status",
+    "run_id", "timestamp", "storage_mode", "filename", "load_lock", "source", "pipeline_status",
     "verdict", "status", "score", "grade", "anomalies_total", "quarantined",
     "decision_reason", "report_html", "verdict_json", "quarantine_key",
 ]
@@ -154,6 +154,7 @@ def build_runs_df(runs: list[dict] | None) -> pd.DataFrame:
         if not isinstance(run, dict):
             continue
         resume = _mapping(run.get("summary"))
+        artifacts = _mapping(run.get("artifacts"))
         lignes.append(
             {
                 "run_id": run.get("run_id"),
@@ -164,13 +165,15 @@ def build_runs_df(runs: list[dict] | None) -> pd.DataFrame:
                 **{colonne: resume.get(colonne) for colonne in RUN_COLUMNS[5:]},
                 "run_status": derive_run_status(run, resume),
                 "stop_reason": run.get("stop_reason") or resume.get("stop_reason") or resume.get("pipeline_reason"),
+                "consolidated_report_html": artifacts.get("consolidated_report_html")
+                or run.get("consolidated_report_html"),
             }
         )
     df = pd.DataFrame(lignes, columns=RUN_COLUMNS)
     for colonne in ("started_at", "finished_at"):
         df[colonne] = pd.to_datetime(df[colonne], errors="coerce", utc=True)
     for colonne in RUN_COLUMNS[2:]:
-        if colonne not in {"storage_mode", "finished_at", "run_status", "stop_reason"}:
+        if colonne not in {"storage_mode", "finished_at", "run_status", "stop_reason", "consolidated_report_html"}:
             df[colonne] = pd.to_numeric(df[colonne], errors="coerce")
     return df
 
@@ -181,24 +184,27 @@ def _file_records(runs: list[dict] | None):
             continue
         timestamp = run.get("started_at_utc")
         run_id = run.get("run_id")
+        storage_mode = run.get("storage_mode") or "local"
         for fichier in _files(run.get("files")):
             if isinstance(fichier, dict):
-                yield run_id, timestamp, fichier
+                yield run_id, timestamp, storage_mode, fichier
 
 
 def build_files_df(runs: list[dict] | None) -> pd.DataFrame:
     lignes = []
-    for run_id, timestamp, fichier in _file_records(runs):
+    for run_id, timestamp, storage_mode, fichier in _file_records(runs):
         pipeline_status = fichier.get("pipeline_status")
+        artifacts = _mapping(fichier.get("artifacts"))
         incomplet = str(pipeline_status or "").upper() == "INCOMPLETE"
         verdict = None if incomplet else fichier.get("verdict")
         lignes.append(
             {
                 "run_id": run_id,
                 "timestamp": timestamp,
+                "storage_mode": storage_mode,
                 "filename": fichier.get("filename"),
                 "load_lock": fichier.get("load_lock"),
-                "source": fichier.get("source"),
+                "source": fichier.get("source") or artifacts.get("source"),
                 "pipeline_status": pipeline_status,
                 "verdict": verdict,
                 "status": effective_status(pipeline_status, verdict),
@@ -207,9 +213,9 @@ def build_files_df(runs: list[dict] | None) -> pd.DataFrame:
                 "anomalies_total": fichier.get("anomalies_total"),
                 "quarantined": fichier.get("quarantined") if isinstance(fichier.get("quarantined"), bool) else pd.NA,
                 "decision_reason": fichier.get("decision_reason") or fichier.get("reason"),
-                "report_html": fichier.get("report_html"),
-                "verdict_json": fichier.get("verdict_json"),
-                "quarantine_key": fichier.get("quarantine_key"),
+                "report_html": fichier.get("report_html") or artifacts.get("report_html"),
+                "verdict_json": fichier.get("verdict_json") or artifacts.get("verdict_json"),
+                "quarantine_key": fichier.get("quarantine_key") or artifacts.get("quarantine"),
             }
         )
     df = pd.DataFrame(lignes, columns=FILE_COLUMNS)
@@ -222,7 +228,7 @@ def build_files_df(runs: list[dict] | None) -> pd.DataFrame:
 
 def _build_counter_df(runs, field: str, name: str, columns: list[str]) -> pd.DataFrame:
     lignes = []
-    for run_id, timestamp, fichier in _file_records(runs):
+    for run_id, timestamp, _storage_mode, fichier in _file_records(runs):
         for cle, nombre in _mapping(fichier.get(field)).items():
             lignes.append(
                 {
@@ -242,7 +248,7 @@ def _build_counter_df(runs, field: str, name: str, columns: list[str]) -> pd.Dat
 
 def build_agents_df(runs: list[dict] | None) -> pd.DataFrame:
     lignes = []
-    for run_id, timestamp, fichier in _file_records(runs):
+    for run_id, timestamp, _storage_mode, fichier in _file_records(runs):
         compteurs = {}
         for cle, valeur in _mapping(fichier.get("anomalies_by_agent")).items():
             agent = normalize_agent_key(cle)
@@ -364,6 +370,21 @@ def _file_identity(row: pd.Series) -> str:
     return f"record::{row.name}"
 
 
+def unique_file_identity_count(files_df: pd.DataFrame, *, impacted_only: bool = False) -> int:
+    """Count distinct source identities without deduplicating the underlying history."""
+    if files_df.empty:
+        return 0
+    selected = files_df.copy()
+    if impacted_only:
+        if "anomalies_total" not in selected:
+            return 0
+        anomalies = pd.to_numeric(selected.get("anomalies_total"), errors="coerce")
+        selected = selected.loc[anomalies > 0]
+    if selected.empty:
+        return 0
+    return int(selected.apply(_file_identity, axis=1).nunique())
+
+
 def latest_records_by_file(files_df: pd.DataFrame) -> pd.DataFrame:
     """Return only the most recent audit record for each file identity."""
     if files_df.empty:
@@ -373,6 +394,51 @@ def latest_records_by_file(files_df: pd.DataFrame) -> pd.DataFrame:
     if "timestamp" in latest:
         latest = latest.sort_values("timestamp", na_position="first")
     return latest.drop_duplicates("_file_identity", keep="last").drop(columns="_file_identity")
+
+
+def filter_runs_by_view(runs_df: pd.DataFrame, view: str) -> pd.DataFrame:
+    """Filter the Runs page only; persisted history is never mutated or removed."""
+    if runs_df.empty or str(view).strip().lower() == "all runs":
+        return runs_df.copy()
+    if "files_processed" not in runs_df:
+        return runs_df.iloc[0:0].copy()
+    processed = pd.to_numeric(runs_df.get("files_processed"), errors="coerce")
+    return runs_df.loc[processed > 0].copy()
+
+
+def agent_audit_points(agents_df: pd.DataFrame, files_df: pd.DataFrame) -> pd.DataFrame:
+    """Presentation records for one persisted agent count in one audit file record."""
+    columns = [
+        "audit_time", "agent", "detections", "filename", "load_lock",
+        "agent_status", "pipeline_status", "verdict",
+    ]
+    if agents_df.empty or not {"timestamp", "agent", "count"}.issubset(agents_df.columns):
+        return pd.DataFrame(columns=columns)
+
+    points = agents_df.copy()
+    points["audit_time"] = pd.to_datetime(points["timestamp"], errors="coerce", utc=True)
+    points["detections"] = pd.to_numeric(points["count"], errors="coerce")
+    points["agent"] = points["agent"].map(agent_display_label)
+    points["agent_status"] = points.get(
+        "status", pd.Series("UNKNOWN", index=points.index)
+    ).fillna("UNKNOWN")
+
+    join_keys = [
+        column for column in ("run_id", "filename", "load_lock")
+        if column in points.columns and column in files_df.columns
+    ]
+    context_columns = [
+        column for column in ("pipeline_status", "verdict") if column in files_df.columns
+    ]
+    if join_keys and context_columns:
+        context = files_df[join_keys + context_columns].drop_duplicates(join_keys, keep="last")
+        points = points.merge(context, on=join_keys, how="left", suffixes=("", "_audit"))
+
+    for column in ("filename", "load_lock", "pipeline_status", "verdict"):
+        if column not in points:
+            points[column] = pd.NA
+    points = points.dropna(subset=["audit_time", "detections"])
+    return points[columns]
 
 
 def latest_audit_record(files_df: pd.DataFrame) -> pd.Series | None:

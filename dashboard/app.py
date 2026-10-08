@@ -105,24 +105,24 @@ history_location = (
 history_source_label = "S3 history" if config.STORAGE_MODE == "s3" else "Local history"
 st.sidebar.markdown('<div class="dq-sidebar-section">ENVIRONMENT</div>', unsafe_allow_html=True)
 st.sidebar.markdown(status_badge_html(config.STORAGE_MODE), unsafe_allow_html=True)
+st.sidebar.caption(f"Last update: {st.session_state.last_refresh}")
 
 filtres = None
 if page != "New Audit":
     filtres = render_global_filters(files_df)
 
-st.sidebar.markdown('<div class="dq-sidebar-section">DATA SOURCE STATUS</div>', unsafe_allow_html=True)
-st.sidebar.caption(f"Executions loaded: {len(runs_df)}")
-st.sidebar.caption(f"Audited file records loaded: {len(files_df)}")
-st.sidebar.caption(f"Last refresh: {st.session_state.last_refresh}")
-st.sidebar.markdown(
-    f'<div class="sidebar-data-line" title="{escape(history_location)}">'
-    f'History source: {escape(history_source_label)}</div>',
-    unsafe_allow_html=True,
-)
-if st.sidebar.button("Refresh data", use_container_width=True):
-    st.cache_data.clear()
-    st.session_state.last_refresh = utc_now_label()
-    st.rerun()
+with st.sidebar.expander("System status", expanded=False):
+    st.caption(f"Executions loaded: {len(runs_df)}")
+    st.caption(f"Audit records loaded: {len(files_df)}")
+    st.markdown(
+        f'<div class="sidebar-data-line" title="{escape(history_location)}">'
+        f'History source: {escape(history_source_label)}</div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("Refresh data", use_container_width=True, key="refresh_dashboard_data"):
+        st.cache_data.clear()
+        st.session_state.last_refresh = utc_now_label()
+        st.rerun()
 
 audit_job = st.session_state.get("audit_job") or {}
 if audit_job.get("state") == "RUNNING":

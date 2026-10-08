@@ -198,7 +198,7 @@ def _render_last_result() -> None:
 
 def render(available_files: list[dict]) -> None:
     render_page_header("New Audit", "Configure and launch a Data Quality audit.")
-    st.warning("Action page: launching an audit executes the pipeline and may call OpenRouter LLMs.")
+    st.info("Running an audit may invoke LLM-based analysis depending on the selected files.")
 
     if not available_files:
         render_empty_state(

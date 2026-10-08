@@ -10,12 +10,14 @@ from dashboard.components import (
     render_empty_state,
     render_page_header,
     status_badge_html,
+    style_status_columns,
 )
 from dashboard import charts
 from dashboard.transformations import (
     AGENT_DISPLAY_LABELS,
     AGENT_ORDER,
     aggregate_agent_counts,
+    agent_audit_points,
     normalize_agent_key,
 )
 
@@ -108,7 +110,10 @@ def render(agents_df: pd.DataFrame, files_df: pd.DataFrame | None = None) -> Non
                 st.markdown('<div class="agent-status-label">Latest known status</div>', unsafe_allow_html=True)
                 st.markdown(status_badge_html(metrics["status"]), unsafe_allow_html=True)
                 st.metric("Historical detections", format_optional_number(metrics["historical_detections"]))
-                st.metric("Executed audits", format_optional_number(metrics["executed"]))
+                st.metric(
+                    "Audits with agent status",
+                    format_optional_number(metrics["records_with_status"]),
+                )
                 st.caption(
                     "Success rate: **"
                     + format_optional_number(metrics["success_rate"], 1, suffix="%")
@@ -118,9 +123,8 @@ def render(agents_df: pd.DataFrame, files_df: pd.DataFrame | None = None) -> Non
                     f"{metrics['successful']} successful · {metrics['failed']} failed"
                 )
                 st.caption(
-                    f"Status metadata available for {metrics['records_with_status']}/"
-                    f"{metrics['audit_records']} historical records · "
-                    f"{metrics['not_run']} not run · {metrics['unknown']} unknown"
+                    f"Status metadata: {metrics['records_with_status']}/{metrics['audit_records']} records · "
+                    f"Unknown: {metrics['unknown']} · Not run: {metrics['not_run']}"
                 )
                 if key == "realisme" and metrics["failed"]:
                     st.warning("Realism failures require review; detection count may be unavailable.")
@@ -169,38 +173,13 @@ def render(agents_df: pd.DataFrame, files_df: pd.DataFrame | None = None) -> Non
                     )
                 )
 
-    trend_data = agents_df.copy()
-    if {"timestamp", "count", "agent"}.issubset(trend_data.columns):
-        trend_data["Audit time"] = pd.to_datetime(trend_data["timestamp"], errors="coerce", utc=True)
-        trend_data["Detections"] = pd.to_numeric(trend_data["count"], errors="coerce")
-        trend_data["Agent"] = trend_data["agent"].map(
-            lambda value: AGENT_DISPLAY_LABELS.get(normalize_agent_key(value), str(value).title())
+    audit_points = agent_audit_points(agents_df, files_df)
+    if not audit_points.empty:
+        st.markdown("### Agent Detections by Audit")
+        st.caption(
+            "Each point represents the persisted detection count for an agent in one audit record."
         )
-        trend_data = (
-            trend_data.dropna(subset=["Audit time", "Detections"])
-            .groupby(["Audit time", "Agent"], as_index=False)["Detections"]
-            .sum()
-        )
-    else:
-        trend_data = pd.DataFrame()
-    if not trend_data.empty and trend_data["Audit time"].nunique() >= 2:
-        st.markdown("### Agent Detections Over Time")
-        st.caption("Persisted anomaly detections by agent for each audit time.")
-        charts.show(
-            charts.multi_line(
-                trend_data,
-                x="Audit time",
-                y="Detections",
-                group="Agent",
-                value_title="Detections",
-                colors={
-                    "Structure": charts.GREEN,
-                    "Statistics": charts.BLUE,
-                    "Coherence": charts.PURPLE,
-                    "Realism": charts.AMBER,
-                },
-            )
-        )
+        charts.show(charts.agent_detections_by_audit(audit_points))
 
     st.markdown("### Agent Details")
     detail_rows = []
@@ -219,4 +198,9 @@ def render(agents_df: pd.DataFrame, files_df: pd.DataFrame | None = None) -> Non
                 "Success Rate": format_optional_number(metrics["success_rate"], 1, suffix="%"),
             }
         )
-    st.dataframe(detail_rows, hide_index=True, use_container_width=True)
+    detail_frame = pd.DataFrame(detail_rows)
+    st.dataframe(
+        style_status_columns(detail_frame, ["Status"]),
+        hide_index=True,
+        use_container_width=True,
+    )

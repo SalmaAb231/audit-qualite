@@ -29,7 +29,7 @@ sans traitement spécifique par source.
 | Champ           | Type            | Description                                                                 |
 |-----------------|-----------------|-------------------------------------------------------------------------------|
 | `fichier`       | `string`        | Nom du fichier source dans lequel l'anomalie a été détectée.                 |
-| `ligne`         | `int`           | Numéro de la ligne concernée (index 0-based ou 1-based, à fixer et documenter lors de l'implémentation). |
+| `ligne`         | `int`           | Index pandas d'origine, **0-based**, lorsqu'une ligne précise a été conservée. L'ancien contrat utilisait aussi `0` pour certaines anomalies globales ; cette ambiguïté est signalée comme telle dans la traçabilité et ne doit jamais être présentée comme une cellule exacte. |
 | `colonnes`      | `list[string]`  | Colonne(s) impliquée(s) dans l'anomalie.                                     |
 | `type`          | `enum`          | Catégorie de l'anomalie. Valeurs possibles : `structure`, `statistique`, `coherence`, `realisme`. |
 | `severite`      | `enum`          | Gravité de l'anomalie. Valeurs possibles : `critical`, `high`, `medium`, `low`. |
@@ -74,3 +74,31 @@ fichier, selon les seuils définis dans `config.py` :
 
 Le détail exact du calcul d'agrégation (moyenne pondérée, minimum, etc.)
 sera défini lors de l'implémentation du module `judge/`.
+
+## Enrichissement de traçabilité persisté
+
+Après le Judge, l'orchestrateur ajoute un bloc purement descriptif sans
+modifier la détection, la sévérité, la confiance, le score ou le verdict :
+
+- `anomaly_id`, `run_id`, `audit_timestamp_utc`, `load_lock`, `filename`,
+  `source_reference` ;
+- `agent` / `agents`, `issue_type`, `description`, `detected_value` ;
+- `location.scope` : `CELL`, `ROW`, `COLUMN`, `FILE` ou `MULTI_ROW` ;
+- `location.row_index_0_based` et `location.row_indices_0_based` uniquement
+  quand les indices exacts sont disponibles ;
+- `location.row_number_1_based` = index + 1 pour l'affichage métier ;
+- `location.physical_row_number_1_based` = index + 2 pour les CSV/Excel lus
+  avec une ligne d'en-tête par défaut ;
+- `location.available`, `precision` et `unavailable_reason` afin de ne jamais
+  inventer une ligne, une colonne, une cellule ou un onglet Excel absent.
+
+Le loader conserve désormais un sidecar technique (jamais ajouté au
+DataFrame ni envoyé aux agents) avec le nom réel de la première feuille,
+l'ordre des colonnes, le nombre de lignes d'en-tête et la preuve que l'index
+est un `RangeIndex` 0-based. Pour un nouveau fichier Excel chargé par cette
+chaîne, une anomalie CELL exacte peut donc recevoir une référence comme
+`S670`. Sans ce sidecar (notamment pour les artefacts legacy), la ligne
+physique et la cellule restent `null`.
+Les anomalies multi-lignes ne publient une liste exacte que si les indices
+ont réellement été persistés ; un simple compte et une ligne représentative
+produisent une localisation `PARTIAL`.

@@ -4,14 +4,26 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from html import escape
+import hashlib
 import math
+from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as st_components
 
 from dashboard import charts
+from dashboard.artifacts import (
+    artifact_reference_status,
+    read_artifact_cached,
+    read_json_artifact,
+    resolve_local_artifact,
+    mime_type_for_reference,
+    is_versioned_run_reference,
+)
+import config
 
 
 # Kept only as an import-compatible constant; the professional UI no longer renders pictograms.
@@ -320,6 +332,20 @@ def render_metric_card(
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_metric_grid(items: Iterable[tuple[str, Any, str | None]]) -> None:
+    """Responsive KPI grid used when fixed Streamlit columns become too narrow."""
+    cards = []
+    for label, value, helper in items:
+        helper_html = f'<div class="metric-helper">{escape(str(helper))}</div>' if helper else ""
+        cards.append(
+            '<div class="metric-card metric-grid-card">'
+            f'<div class="metric-label">{escape(str(label))}</div>'
+            f'<div class="metric-value">{escape(display_value(value))}</div>'
+            f'{helper_html}</div>'
+        )
+    st.markdown(f'<div class="metric-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 
 def _metric_row(items: Iterable[tuple[str, Any]], columns: int = 5) -> None:
@@ -669,6 +695,19 @@ def render_filtered_view_summary(
     st.sidebar.caption(f"{counts['displayed_files']} of {counts['loaded_files']} audited files")
 
 
+def _info_value_html(label: Any, value: Any) -> str:
+    semantic_values = {
+        "ACCEPTED", "WARNING", "REJECTED", "INCOMPLETE", "SUCCESS", "FAILED",
+        "COMPLETE", "COMPLETED", "NOT RUN", "UNKNOWN", "NO FILE PROCESSED",
+        "CRITICAL", "HIGH", "MEDIUM", "LOW",
+    }
+    if str(label).strip().lower() in {
+        "status", "execution status", "pipeline status", "judge verdict", "outcome",
+    } or status_label(value) in semantic_values:
+        return status_badge_html(value)
+    return escape(display_value(value))
+
+
 def render_info_grid(items: Mapping[str, Any] | Iterable[tuple[str, Any]]) -> None:
     pairs = list(items.items()) if isinstance(items, Mapping) else list(items)
     if not pairs:
@@ -682,9 +721,56 @@ def render_info_grid(items: Mapping[str, Any] | Iterable[tuple[str, Any]]) -> No
         with columns[index % len(columns)]:
             st.markdown(
                 f'<div class="{css_class}"><div class="info-label">{escape(str(label))}</div>'
-                f'<div class="info-value">{escape(display_value(value))}</div></div>',
+                f'<div class="info-value">{_info_value_html(label, value)}</div></div>',
                 unsafe_allow_html=True,
             )
+
+
+def render_compact_info_grid(items: Iterable[tuple[str, Any]]) -> None:
+    """Responsive compact detail grid, including semantic status badges."""
+    cards = [
+        '<div class="compact-info-item">'
+        f'<div class="info-label">{escape(str(label))}</div>'
+        f'<div class="compact-info-value">{_info_value_html(label, value)}</div>'
+        '</div>'
+        for label, value in items
+    ]
+    st.markdown(f'<div class="compact-info-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def status_cell_style(value: Any) -> str:
+    """Subtle semantic cell styling for client-facing Streamlit tables."""
+    label = status_label(value)
+    palette = {
+        "ACCEPTED": ("#eafbf1", "#067647"),
+        "SUCCESS": ("#eafbf1", "#067647"),
+        "COMPLETE": ("#eafbf1", "#067647"),
+        "COMPLETED": ("#eafbf1", "#067647"),
+        "WARNING": ("#fff7e6", "#a15c00"),
+        "MEDIUM": ("#fff7e6", "#a15c00"),
+        "HIGH": ("#fff2e8", "#c2410c"),
+        "REJECTED": ("#fff0ef", "#b42318"),
+        "FAILED": ("#fff0ef", "#b42318"),
+        "CRITICAL": ("#fff0ef", "#b42318"),
+        "INCOMPLETE": ("#f1f4f8", "#526177"),
+        "NOT RUN": ("#f1f4f8", "#526177"),
+        "UNKNOWN": ("#f1f4f8", "#526177"),
+        "NO FILE PROCESSED": ("#f1f4f8", "#526177"),
+        "LOW": ("#f1f4f8", "#526177"),
+        "N/A": ("#f1f4f8", "#526177"),
+    }
+    background, color = palette.get(label, ("transparent", "inherit"))
+    return (
+        f"background-color: {background}; color: {color}; font-weight: 700; "
+        "border-radius: 999px; text-align: center"
+    )
+
+
+def style_status_columns(frame: pd.DataFrame, columns: Iterable[str]):
+    existing = [column for column in columns if column in frame.columns]
+    if not existing:
+        return frame
+    return frame.style.map(status_cell_style, subset=existing)
 
 
 def render_outcome_bar_chart(counts: pd.Series) -> None:
@@ -750,17 +836,124 @@ def render_utc_line_chart(series: pd.Series, *, title: str, value_title: str) ->
     charts.show(charts.line_series(series, value_title=value_title))
 
 
-def render_artifact_references(items: Iterable[tuple[str, Any]]) -> None:
-    available = [(label, value) for label, value in items if not is_missing(value)]
-    if not available:
-        return
-    with st.expander("Artifacts", expanded=False):
-        for label, value in available:
-            st.markdown(
-                f'<div class="artifact-reference"><div class="artifact-label">{escape(label)}</div>'
-                f'<code>{escape(str(value))}</code></div>',
-                unsafe_allow_html=True,
+def local_artifact_path(reference: Any) -> Path | None:
+    return resolve_local_artifact(reference)
+
+
+def render_artifact_access(
+    label: str,
+    reference: Any,
+    *,
+    mime_type: str,
+    download_label: str,
+    storage_mode: str = "local",
+    artifact_kind: str = "binary",
+    action_label: str | None = None,
+    key: str | None = None,
+    expected_run_id: Any = None,
+) -> bool:
+    """Charge un artefact uniquement après l'action explicite de l'utilisateur."""
+    st.markdown(f"#### {escape(label)}")
+    status = artifact_reference_status(reference, storage_mode)
+    status_slot = st.empty()
+
+    def _show_status(value: str) -> None:
+        status_class = {
+            "AVAILABLE": "success",
+            "REFERENCED": "warning",
+            "NOT AVAILABLE": "unknown",
+            "ERROR": "error",
+        }.get(value, "unknown")
+        status_slot.markdown(
+            f'<span class="status-badge status-{status_class}">{escape(value)}</span>',
+            unsafe_allow_html=True,
+        )
+
+    _show_status(status)
+    if status == "NOT AVAILABLE":
+        st.caption("No artifact reference was stored for this audit record.")
+        return False
+    if artifact_kind == "html" and expected_run_id and not is_versioned_run_reference(reference, expected_run_id):
+        st.warning(
+            "Historical report reference is not versioned by run. It may be a legacy latest alias."
+        )
+
+    digest = hashlib.sha256(f"{storage_mode}:{reference}:{label}".encode("utf-8")).hexdigest()[:16]
+    state_key = key or f"artifact_loaded_{digest}"
+    if st.button(
+        action_label or ("Open report" if artifact_kind == "html" else f"Load {label.lower()}"),
+        key=f"{state_key}_button",
+        use_container_width=True,
+    ):
+        st.session_state[state_key] = True
+    if not st.session_state.get(state_key):
+        st.caption("Content is loaded on demand from the persisted reference.")
+        return False
+
+    result = read_artifact_cached(str(reference), str(storage_mode or "local"), config.S3_BUCKET)
+    if result.status != "AVAILABLE" or result.payload is None:
+        _show_status("ERROR" if result.status == "ERROR" else "NOT AVAILABLE")
+        st.error(result.error or "The referenced artifact could not be loaded.")
+        with st.expander("Technical reference"):
+            st.code(str(reference), language="text")
+        return False
+
+    payload = result.payload
+    _show_status("AVAILABLE")
+    file_name = Path(str(reference).replace("\\", "/")).name or "artifact"
+    if artifact_kind == "html":
+        try:
+            html_payload = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            st.error("The report is not valid UTF-8 HTML.")
+        else:
+            st_components.html(html_payload, height=640, scrolling=True)
+    elif artifact_kind == "json":
+        document, parsed = read_json_artifact(
+            reference,
+            storage_mode,
+            reader=lambda _ref, _mode: result,
+        )
+        if document is None:
+            st.error(parsed.error or "The verdict JSON could not be decoded.")
+        else:
+            anomalies = document.get("anomalies_consolidees", document.get("anomalies", []))
+            anomalies = anomalies if isinstance(anomalies, list) else []
+            render_info_grid(
+                [
+                    ("Pipeline status", display_value(document.get("pipeline_status"))),
+                    ("Judge verdict", display_value(document.get("verdict"))),
+                    ("Score", format_optional_number(document.get("score"), 2)),
+                    ("Grade", display_value(document.get("grade"))),
+                    ("Detailed anomalies", len(anomalies)),
+                    (
+                        "Decision reason",
+                        display_value(document.get("decision_reason") or document.get("justification")),
+                    ),
+                ]
             )
+            with st.expander("Raw verdict JSON"):
+                st.json(document)
+    st.download_button(
+        download_label,
+        data=payload,
+        file_name=file_name,
+        mime=mime_type_for_reference(reference, mime_type),
+        key=f"{state_key}_download",
+        use_container_width=True,
+    )
+    return True
+
+
+def render_artifact_references(items: Iterable[tuple[str, Any]]) -> None:
+    """Backward-compatible compact artifact status renderer."""
+    for label, value in items:
+        render_artifact_access(
+            label,
+            value,
+            mime_type="application/octet-stream",
+            download_label=f"Download {label.lower()}",
+        )
 
 
 def friendly_file_label(filename: Any, load_lock: Any, timestamp: Any) -> str:

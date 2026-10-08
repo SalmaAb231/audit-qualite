@@ -43,6 +43,7 @@ from history.run_history import (
     generer_run_id,
     maintenant_utc,
 )
+from history.anomaly_traceability import enrich_verdict
 from ingestion.local_loader import LocalLoader
 from ingestion.profiling import construire_inventaire
 from ingestion.s3_client import S3Loader
@@ -189,6 +190,7 @@ def _finaliser_historique_run(
     started_at_utc,
     files_discovered: int,
     fichiers_historique: list,
+    artifacts: dict | None = None,
 ) -> dict:
     """Écrit l'historique puis conserve le chemin, la clé et le statut d'upload."""
     persistance = {
@@ -205,6 +207,7 @@ def _finaliser_historique_run(
             storage_mode=config.STORAGE_MODE,
             files_discovered=files_discovered,
             files=fichiers_historique,
+            artifacts=artifacts,
         )
         chemin_historique = ecrire_historique_local(
             document,
@@ -501,9 +504,16 @@ def _fichiers_a_traiter(
     return fichiers
 
 
-def _sauvegarder_resultats_fichier(info, verdict: dict) -> dict[str, Path]:
+def _sauvegarder_resultats_fichier(
+    info,
+    verdict: dict,
+    run_id: str | None = None,
+) -> dict[str, Path]:
     """Écrit les résultats locaux d'un fichier et retourne leurs chemins."""
-    dossier = config.RESULTATS_DIR / (info.dossier_mois or "sans_mois")
+    dossier = config.RESULTATS_DIR
+    if run_id:
+        dossier = dossier / "runs" / run_id
+    dossier = dossier / (info.dossier_mois or "sans_mois")
     dossier.mkdir(parents=True, exist_ok=True)
     stem = Path(info.nom).stem
 
@@ -595,8 +605,21 @@ def executer_audit(
             logger.error(f"[{i}/{len(fichiers)}] {info.nom} : échec du pipeline ({erreur})", exc_info=True)
             continue
 
+        verdict = enrich_verdict(
+            verdict,
+            run_id=run_id,
+            audit_timestamp_utc=started_at_utc,
+            load_lock=info.dossier_mois,
+            filename=info.nom,
+            source_reference=info.chemin,
+            source_metadata=(
+                loader.source_metadata(info.chemin)
+                if hasattr(loader, "source_metadata")
+                else None
+            ),
+        )
         verdicts.append(verdict)
-        chemins_resultats = _sauvegarder_resultats_fichier(info, verdict)
+        chemins_resultats = _sauvegarder_resultats_fichier(info, verdict, run_id=run_id)
         chemin_rapport = chemins_resultats["rapport"]
         chemin_verdict = chemins_resultats["verdict"]
         reference_rapport = chemin_rapport
@@ -606,8 +629,12 @@ def executer_audit(
 
         if config.STORAGE_MODE == "s3":
             dossier_resultat = info.dossier_mois or "sans_mois"
-            cle_rapport = _construire_cle_rapport_s3(dossier_resultat, chemin_rapport.name)
-            cle_verdict = _construire_cle_rapport_s3(dossier_resultat, chemin_verdict.name)
+            cle_rapport = _construire_cle_rapport_s3(
+                "runs", run_id, dossier_resultat, chemin_rapport.name
+            )
+            cle_verdict = _construire_cle_rapport_s3(
+                "runs", run_id, dossier_resultat, chemin_verdict.name
+            )
             if _uploader_resultat_s3(
                 loader,
                 chemin_rapport,
@@ -639,18 +666,26 @@ def executer_audit(
             )
         )
 
+    artifacts_run = {}
     if verdicts:
         rapport_consolide = generer_rapport_consolide(verdicts)
-        fichier_sortie = config.RESULTATS_DIR / "rapport_consolide.html"
+        fichier_sortie = config.RESULTATS_DIR / "runs" / run_id / "rapport_consolide.html"
+        fichier_sortie.parent.mkdir(parents=True, exist_ok=True)
         fichier_sortie.write_text(rapport_consolide, encoding="utf-8")
         logger.info(f"Rapport consolidé sur {len(verdicts)} fichier(s) : {fichier_sortie}")
+        reference_consolidee = fichier_sortie
         if config.STORAGE_MODE == "s3":
-            _uploader_resultat_s3(
+            cle_consolidee = _construire_cle_rapport_s3(
+                "runs", run_id, fichier_sortie.name
+            )
+            if _uploader_resultat_s3(
                 loader,
                 fichier_sortie,
-                _construire_cle_rapport_s3(fichier_sortie.name),
+                cle_consolidee,
                 "Rapport consolidé",
-            )
+            ):
+                reference_consolidee = cle_consolidee
+        artifacts_run["consolidated_report_html"] = reference_consolidee
 
     persistance_historique = _finaliser_historique_run(
         loader,
@@ -658,6 +693,7 @@ def executer_audit(
         started_at_utc,
         files_discovered,
         fichiers_historique,
+        artifacts=artifacts_run,
     )
 
     return {

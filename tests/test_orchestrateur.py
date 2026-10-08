@@ -124,6 +124,26 @@ def test_cle_quarantaine_s3_utilise_uniquement_des_slashs(monkeypatch):
     assert "\\" not in cle
 
 
+def test_reports_sont_immutables_et_distincts_par_run(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "RESULTATS_DIR", tmp_path)
+    info = _info(nom="same.xlsx", dossier_mois="LOAD_LOCK_202603")
+    verdict = {"fichier": "same.xlsx", "anomalies": [], "verdict": "ACCEPTED"}
+
+    first = orchestrateur._sauvegarder_resultats_fichier(info, verdict, run_id="run-a")
+    second = orchestrateur._sauvegarder_resultats_fichier(info, verdict, run_id="run-b")
+    key_a = orchestrateur._construire_cle_rapport_s3(
+        "runs", "run-a", info.dossier_mois, first["rapport"].name
+    )
+    key_b = orchestrateur._construire_cle_rapport_s3(
+        "runs", "run-b", info.dossier_mois, second["rapport"].name
+    )
+
+    assert first["rapport"].is_file() and second["rapport"].is_file()
+    assert first["rapport"] != second["rapport"]
+    assert key_a == "reports/runs/run-a/LOAD_LOCK_202603/rapport_same.html"
+    assert key_b == "reports/runs/run-b/LOAD_LOCK_202603/rapport_same.html"
+
+
 @pytest.mark.parametrize(
     "verdict,pipeline_status,attendu",
     [
@@ -596,10 +616,10 @@ def test_main_traite_un_fichier_et_ecrit_les_resultats(monkeypatch, tmp_path):
     verdicts = orchestrateur.main(client=_ClientFactice(reponses=[]), coherence_client=coherence_client)
 
     assert len(verdicts) == 1
-    dossier_sortie = tmp_path / "LOAD_LOCK_202604"
+    dossier_sortie = next((tmp_path / "runs").iterdir()) / "LOAD_LOCK_202604"
     assert (dossier_sortie / "verdict_petit.json").exists()
     assert (dossier_sortie / "rapport_petit.html").exists()
-    assert (tmp_path / "rapport_consolide.html").exists()
+    assert (dossier_sortie.parent / "rapport_consolide.html").exists()
     assert len(list((tmp_path / "history" / "runs").rglob("*.json"))) == 1
 
 
@@ -746,16 +766,20 @@ def test_main_s3_transmet_cache_local_et_cle_source(monkeypatch, tmp_path):
     assert len(verdicts) == 1
     assert recus["chemin_fichier_coherence"] == chemin_cache
     assert recus["checkpoint_source_path"] == cle_s3
+    run_id = loader.uploads[0][1].split("/")[2]
     assert loader.uploads[:3] == [
         (
-            tmp_path / "LOAD_LOCK_202603" / "rapport_test.html",
-            "reports/LOAD_LOCK_202603/rapport_test.html",
+            tmp_path / "runs" / run_id / "LOAD_LOCK_202603" / "rapport_test.html",
+            f"reports/runs/{run_id}/LOAD_LOCK_202603/rapport_test.html",
         ),
         (
-            tmp_path / "LOAD_LOCK_202603" / "verdict_test.json",
-            "reports/LOAD_LOCK_202603/verdict_test.json",
+            tmp_path / "runs" / run_id / "LOAD_LOCK_202603" / "verdict_test.json",
+            f"reports/runs/{run_id}/LOAD_LOCK_202603/verdict_test.json",
         ),
-        (tmp_path / "rapport_consolide.html", "reports/rapport_consolide.html"),
+        (
+            tmp_path / "runs" / run_id / "rapport_consolide.html",
+            f"reports/runs/{run_id}/rapport_consolide.html",
+        ),
     ]
     assert len(loader.uploads) == 4
     uploads_history = [upload for upload in loader.uploads if upload[1].startswith("history/runs/")]
@@ -804,9 +828,10 @@ def test_main_local_ne_tente_aucun_upload(monkeypatch, tmp_path):
 
     assert len(verdicts) == 1
     assert loader.nb_uploads == 0
-    assert (tmp_path / "LOAD_LOCK_LOCAL" / "rapport_local.html").is_file()
-    assert (tmp_path / "LOAD_LOCK_LOCAL" / "verdict_local.json").is_file()
-    assert (tmp_path / "rapport_consolide.html").is_file()
+    run_dir = next((tmp_path / "runs").iterdir())
+    assert (run_dir / "LOAD_LOCK_LOCAL" / "rapport_local.html").is_file()
+    assert (run_dir / "LOAD_LOCK_LOCAL" / "verdict_local.json").is_file()
+    assert (run_dir / "rapport_consolide.html").is_file()
     assert len(list((tmp_path / "history" / "runs").rglob("*.json"))) == 1
 
 
@@ -864,9 +889,10 @@ def test_echec_upload_s3_ne_supprime_pas_les_resultats_locaux(monkeypatch, tmp_p
         "quarantine/LOAD_LOCK_202603/test.xlsx",
     )
     assert chemin_cache.is_file()
-    assert (tmp_path / "LOAD_LOCK_202603" / "rapport_test.html").is_file()
-    assert (tmp_path / "LOAD_LOCK_202603" / "verdict_test.json").is_file()
-    assert (tmp_path / "rapport_consolide.html").is_file()
+    run_dir = next((tmp_path / "runs").iterdir())
+    assert (run_dir / "LOAD_LOCK_202603" / "rapport_test.html").is_file()
+    assert (run_dir / "LOAD_LOCK_202603" / "verdict_test.json").is_file()
+    assert (run_dir / "rapport_consolide.html").is_file()
     assert len(list((tmp_path / "history" / "runs").rglob("*.json"))) == 1
 
 

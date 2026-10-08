@@ -15,11 +15,17 @@ from dashboard.components import (
     format_optional_number,
     friendly_file_label,
     is_missing,
-    render_artifact_references,
+    render_artifact_access,
     render_empty_state,
     render_info_grid,
     render_page_header,
+    style_status_columns,
 )
+
+
+def _open_anomaly_explorer() -> None:
+    """Navigate before Streamlit recreates the sidebar navigation widget."""
+    st.session_state.navigation = "Anomalies"
 
 
 def _first(record: pd.Series, *names: str) -> Any:
@@ -89,7 +95,10 @@ def render(
         lambda value: "N/A" if is_missing(value) else ("Yes" if bool(value) else "No")
     )
     st.dataframe(
-        table[["Date", "Filename", "LOAD_LOCK", "Pipeline Status", "Judge Verdict", "Score", "Anomalies", "Quarantined"]],
+        style_status_columns(
+            table[["Date", "Filename", "LOAD_LOCK", "Pipeline Status", "Judge Verdict", "Score", "Anomalies", "Quarantined"]],
+            ["Pipeline Status", "Judge Verdict"],
+        ),
         hide_index=True,
         use_container_width=True,
     )
@@ -129,9 +138,25 @@ def render(
         for label, value in metadata
     ]
     artifact_items = [
-        ("Report", _first(record, "report_key", "report_s3_key", "report_html")),
-        ("Verdict JSON", _first(record, "verdict_key", "verdict_s3_key", "verdict_json")),
-        ("Quarantine object", _first(record, "quarantine_key", "quarantine_s3_key")),
+        (
+            "Report",
+            _first(record, "report_key", "report_s3_key", "report_html"),
+            "text/html",
+            "html",
+        ),
+        (
+            "Verdict JSON",
+            _first(record, "verdict_key", "verdict_s3_key", "verdict_json"),
+            "application/json",
+            "json",
+        ),
+        ("Source file", _first(record, "source"), "application/octet-stream", "binary"),
+        (
+            "Quarantine object",
+            _first(record, "quarantine_key", "quarantine_s3_key"),
+            "application/octet-stream",
+            "binary",
+        ),
     ]
     mask = pd.Series(True, index=agents_df.index)
     for column in ("run_id", "filename", "load_lock"):
@@ -154,6 +179,18 @@ def render(
             ]
         )
     with detections_tab:
+        detailed_reference = _first(record, "verdict_key", "verdict_s3_key", "verdict_json")
+        st.caption(
+            "Detailed anomalies: Referenced"
+            if detailed_reference
+            else "Detailed anomalies: Not available for this historical record"
+        )
+        if detailed_reference:
+            st.button(
+                "Open Anomaly Explorer",
+                key=f"open_anomaly_explorer_{record.get('run_id')}_{selected}",
+                on_click=_open_anomaly_explorer,
+            )
         severity = severity_for_file(record, severity_df)
         if severity.empty:
             st.info("Severity breakdown is not available for this historical record.")
@@ -170,17 +207,33 @@ def render(
             view = selected_agents[["agent", "status", "count"]].copy()
             view.columns = ["Agent", "Execution Status", "Detections"]
             view["Detections"] = view["Detections"].map(format_optional_number)
-            st.dataframe(view, hide_index=True, use_container_width=True)
+            st.dataframe(
+                style_status_columns(view, ["Execution Status"]),
+                hide_index=True,
+                use_container_width=True,
+            )
     with metadata_tab:
         if metadata:
             render_info_grid(metadata)
         else:
             st.info("No additional metadata was stored for this record.")
     with artifacts_tab:
-        if any(not is_missing(value) for _, value in artifact_items):
-            render_artifact_references(artifact_items)
-        else:
-            st.info("No artifact reference was stored for this record.")
+        st.caption("Artifacts are fetched only after you choose an action.")
+        for offset in range(0, len(artifact_items), 2):
+            columns = st.columns(2)
+            for column, item in zip(columns, artifact_items[offset:offset + 2]):
+                label, reference, mime_type, artifact_kind = item
+                with column:
+                    render_artifact_access(
+                        label,
+                        reference,
+                        mime_type=mime_type,
+                        download_label=f"Download {label.lower()}",
+                        storage_mode=record.get("storage_mode") or "local",
+                        artifact_kind=artifact_kind,
+                        key=f"file_{record.get('run_id')}_{selected}_{label}_{offset}",
+                        expected_run_id=record.get("run_id"),
+                    )
     with technical_tab:
         st.caption("Raw persisted values are shown here for diagnosis; they do not override the audit outcome.")
         technical_reason = _first(record, "decision_reason", "reason", "verdict_reason")

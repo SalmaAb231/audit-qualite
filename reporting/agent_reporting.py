@@ -157,9 +157,21 @@ def _nb_bruts(verdict: dict):
 def _ligne_tableau_anomalie(anomalie: dict) -> str:
     severite = anomalie.get("severite") or ""
     colonnes = ", ".join(anomalie.get("colonnes") or []) or "-"
+    location = anomalie.get("location") if isinstance(anomalie.get("location"), dict) else {}
+    scope = location.get("scope") or anomalie.get("portee") or "-"
+    if location.get("available") and location.get("row_index_0_based") is not None:
+        ligne = (
+            f"index {location['row_index_0_based']} (data row {location.get('row_number_1_based')}; "
+            f"physical row {location.get('physical_row_number_1_based') or '-'})"
+        )
+    elif location:
+        ligne = "Unavailable" if not location.get("available") else scope
+    else:
+        ligne = str(anomalie.get("ligne", "-"))
     return (
         f'<tr class="sev-{html.escape(severite)}">'
-        f"<td>{html.escape(str(anomalie.get('ligne', '-')))}</td>"
+        f"<td>{html.escape(str(scope))}</td>"
+        f"<td>{html.escape(ligne)}</td>"
         f"<td>{html.escape(colonnes)}</td>"
         f"<td>{html.escape(anomalie.get('type') or '')}</td>"
         f"<td>{html.escape(', '.join(_sources(anomalie)))}</td>"
@@ -177,7 +189,7 @@ def _tableau_anomalies(anomalies: list) -> str:
         return '<p class="muted">Aucune anomalie détectée.</p>'
     lignes = "".join(_ligne_tableau_anomalie(a) for a in _trier_par_severite(anomalies))
     return (
-        "<table><thead><tr><th>Ligne</th><th>Colonne(s)</th><th>Type principal</th>"
+        "<table><thead><tr><th>Portée</th><th>Ligne source</th><th>Colonne(s)</th><th>Type principal</th>"
         "<th>Sources</th><th>Signalements</th>"
         "<th>Sévérité</th><th>Valeur</th><th>Justification</th><th>Confiance</th>"
         f"</tr></thead><tbody>{lignes}</tbody></table>"

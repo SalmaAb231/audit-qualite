@@ -67,6 +67,10 @@ S3_QUARANTINE_PREFIX = os.getenv("S3_QUARANTINE_PREFIX", "quarantine/")
 # Préfixe de l'historique immuable des exécutions
 S3_HISTORY_PREFIX = os.getenv("S3_HISTORY_PREFIX", "history/")
 
+# Durée du cache de lecture des artefacts du dashboard. Les rapports HTML,
+# verdicts JSON et sources ne sont lus qu'après une action utilisateur.
+ARTIFACT_CACHE_TTL_SECONDS = int(os.getenv("ARTIFACT_CACHE_TTL_SECONDS", "900"))
+
 # Dossier de cache local des fichiers téléchargés depuis S3
 # (voir ingestion/s3_client.py)
 CACHE_DIR = DATA_DIR / "cache"

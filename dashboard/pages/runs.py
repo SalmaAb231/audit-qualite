@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from dashboard.artifacts import is_versioned_run_reference
 from dashboard.components import (
     display_value,
     format_datetime,
@@ -18,10 +19,12 @@ from dashboard.components import (
     is_missing,
     render_empty_state,
     render_info_grid,
+    render_artifact_access,
     render_page_header,
     status_badge_html,
+    style_status_columns,
 )
-from dashboard.transformations import display_columns
+from dashboard.transformations import display_columns, filter_runs_by_view
 from dashboard.validation import (
     history_agent_coverage,
     history_metric_coverage,
@@ -83,43 +86,58 @@ def render(
         render_empty_state("No execution history", "No audit execution is available for the selected view.")
         return
 
-    table = pd.DataFrame(index=runs_df.index)
-    table["Date"] = runs_df.get("started_at", pd.Series(index=runs_df.index)).map(format_datetime)
-    table["Run ID"] = runs_df.get("run_id", pd.Series(index=runs_df.index)).map(
+    view = st.radio(
+        "View",
+        ["Processed runs", "All runs"],
+        horizontal=True,
+        key="runs_view_mode",
+    )
+    visible_runs = filter_runs_by_view(runs_df, view)
+    if visible_runs.empty:
+        st.info("No processed run is available. Select All runs to include zero-file executions.")
+        return
+
+    table = pd.DataFrame(index=visible_runs.index)
+    table["Date"] = visible_runs.get("started_at", pd.Series(index=visible_runs.index)).map(format_datetime)
+    table["Run ID"] = visible_runs.get("run_id", pd.Series(index=visible_runs.index)).map(
         format_short_run_id
     )
-    table["Execution Status"] = runs_df.get("run_status", pd.Series(index=runs_df.index)).map(display_value)
-    table["Audit File Records"] = runs_df.get("files_processed", pd.Series(index=runs_df.index)).map(format_optional_number)
-    table["Accepted"] = runs_df.get("accepted", pd.Series(index=runs_df.index)).map(format_optional_number)
-    table["Warning"] = runs_df.get("warning", pd.Series(index=runs_df.index)).map(format_optional_number)
-    table["Rejected"] = runs_df.get("rejected", pd.Series(index=runs_df.index)).map(format_optional_number)
-    table["Incomplete"] = runs_df.get("incomplete", pd.Series(index=runs_df.index)).map(format_optional_number)
-    table["Anomalies"] = runs_df.get("total_anomalies", pd.Series(index=runs_df.index)).map(format_optional_number)
-    table["Duration"] = runs_df.get("duration_seconds", pd.Series(index=runs_df.index)).map(format_duration)
+    table["Execution Status"] = visible_runs.get("run_status", pd.Series(index=visible_runs.index)).map(display_value)
+    table["Audit File Records"] = visible_runs.get("files_processed", pd.Series(index=visible_runs.index)).map(format_optional_number)
+    table["Accepted"] = visible_runs.get("accepted", pd.Series(index=visible_runs.index)).map(format_optional_number)
+    table["Warning"] = visible_runs.get("warning", pd.Series(index=visible_runs.index)).map(format_optional_number)
+    table["Rejected"] = visible_runs.get("rejected", pd.Series(index=visible_runs.index)).map(format_optional_number)
+    table["Incomplete"] = visible_runs.get("incomplete", pd.Series(index=visible_runs.index)).map(format_optional_number)
+    table["Anomalies"] = visible_runs.get("total_anomalies", pd.Series(index=visible_runs.index)).map(format_optional_number)
+    table["Duration"] = visible_runs.get("duration_seconds", pd.Series(index=visible_runs.index)).map(format_duration)
 
     health = []
-    for _, row in runs_df.iterrows():
+    for _, row in visible_runs.iterrows():
         run_id = row.get("run_id")
         related = files_df[files_df["run_id"] == run_id] if "run_id" in files_df else pd.DataFrame()
         payload = raw_by_id.get(run_id) or _run_payload(row, related)
         health.append(validate_history_run(payload).status)
     table["Record Consistency"] = health
-    st.dataframe(table, hide_index=True, use_container_width=True)
+    st.dataframe(
+        style_status_columns(table, ["Execution Status", "Record Consistency"]),
+        hide_index=True,
+        use_container_width=True,
+    )
     st.caption(
         "Execution Status describes whether the pipeline run finished. "
         "Audit Outcomes describe the quality-analysis results of processed files."
     )
 
     st.subheader("Run Details")
-    choices = list(runs_df.index)
+    choices = list(visible_runs.index)
     selected = st.selectbox(
         "Select an execution",
         choices,
-        format_func=lambda index: f"{format_short_run_id(runs_df.loc[index].get('run_id'))} — "
-        f"{format_datetime(runs_df.loc[index].get('started_at'))} — "
-        f"{display_value(runs_df.loc[index].get('run_status'))}",
+        format_func=lambda index: f"{format_short_run_id(visible_runs.loc[index].get('run_id'))} — "
+        f"{format_datetime(visible_runs.loc[index].get('started_at'))} — "
+        f"{display_value(visible_runs.loc[index].get('run_status'))}",
     )
-    row = runs_df.loc[selected]
+    row = visible_runs.loc[selected]
     run_id = row.get("run_id")
     related = files_df[files_df["run_id"] == run_id] if "run_id" in files_df else pd.DataFrame()
     raw_payload = raw_by_id.get(run_id)
@@ -221,7 +239,48 @@ def render(
                 visible[column] = visible[column].map(display_value)
         if "Score" in visible:
             visible["Score"] = visible["Score"].map(lambda value: format_optional_number(value, 2))
-        st.dataframe(visible, hide_index=True, use_container_width=True)
+        st.dataframe(
+            style_status_columns(visible, ["Pipeline Status", "Judge Verdict"]),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.markdown("#### Consolidated Artifact")
+    artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), dict) else {}
+    consolidated_reference = (
+        artifacts.get("consolidated_report_html")
+        or row.get("consolidated_report_html")
+    )
+    consolidated_is_safe = is_versioned_run_reference(consolidated_reference, run_id)
+    file_report_count = (
+        int(related["report_html"].notna().sum())
+        if not related.empty and "report_html" in related
+        else 0
+    )
+    render_info_grid(
+        [
+            ("File reports referenced", file_report_count),
+            (
+                "Consolidated report",
+                "Referenced" if consolidated_is_safe else "Not available",
+            ),
+        ]
+    )
+    if consolidated_reference and not consolidated_is_safe:
+        st.warning(
+            "The stored consolidated report reference is not versioned for this run, "
+            "so no historical report action is offered."
+        )
+    render_artifact_access(
+        "Consolidated report",
+        consolidated_reference if consolidated_is_safe else None,
+        mime_type="text/html",
+        download_label="Download consolidated report",
+        storage_mode=row.get("storage_mode") or "local",
+        artifact_kind="html",
+        key=f"run_consolidated_{run_id}",
+        expected_run_id=run_id,
+    )
 
     with st.expander("Technical details"):
         raw = raw_payload or row.get("raw_history")

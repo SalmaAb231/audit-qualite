@@ -36,6 +36,12 @@ AGENT_STATUS_COLORS = {
     "NOT_RUN": SLATE,
     "UNKNOWN": "#94a3b8",
 }
+AGENT_COLORS = {
+    "Structure": GREEN,
+    "Statistics": BLUE,
+    "Coherence": PURPLE,
+    "Realism": AMBER,
+}
 
 
 def get_severity_color(severity: object) -> str:
@@ -200,39 +206,122 @@ def multi_line(
 
 
 def anomalies_per_audit(frame: pd.DataFrame) -> go.Figure:
-    """Per-record anomaly series with business context in the hover."""
+    """Independent audit points; no line implies a cross-file time trend."""
     data = frame.copy()
-    data["_timestamp"] = pd.to_datetime(data.get("timestamp"), errors="coerce", utc=True)
-    data["_anomalies"] = pd.to_numeric(data.get("anomalies_total"), errors="coerce")
+    timestamps = data.get("timestamp", pd.Series(pd.NaT, index=data.index))
+    anomalies = data.get("anomalies_total", pd.Series(pd.NA, index=data.index))
+    data["_timestamp"] = pd.to_datetime(timestamps, errors="coerce", utc=True)
+    data["_anomalies"] = pd.to_numeric(anomalies, errors="coerce")
     data = data.dropna(subset=["_timestamp", "_anomalies"]).sort_values("_timestamp")
-    filenames = data.get("filename", pd.Series("N/A", index=data.index)).fillna("N/A").astype(str)
-    pipeline = data.get("pipeline_status", pd.Series("N/A", index=data.index)).fillna("N/A").astype(str)
-    verdict = data.get("verdict", pd.Series("N/A", index=data.index)).fillna("N/A").astype(str)
-    outcomes = data.get("status", verdict).fillna("INCOMPLETE").astype(str).str.upper()
-    fig = go.Figure(
-        go.Scatter(
-            x=data["_timestamp"],
-            y=data["_anomalies"],
-            mode="lines+markers",
-            line=dict(color=BLUE, width=2),
-            marker=dict(
-                size=8,
-                color=[OUTCOME_COLORS.get(value, SLATE) for value in outcomes],
-                line=dict(color="white", width=1.5),
-            ),
-            customdata=list(zip(filenames, pipeline, verdict)),
-            hovertemplate=(
-                "%{x|%d %b %Y, %H:%M UTC}<br>"
-                "File: %{customdata[0]}<br>"
-                "Anomalies: %{y:,.0f}<br>"
-                "Pipeline status: %{customdata[1]}<br>"
-                "Judge verdict: %{customdata[2]}<extra></extra>"
-            ),
+    data["_outcome"] = data.get(
+        "status", data.get("verdict", pd.Series("INCOMPLETE", index=data.index))
+    ).fillna("INCOMPLETE").astype(str).str.upper()
+    # Only truly overlapping markers receive a tiny display offset. Hover keeps the persisted time.
+    overlap_rank = data.groupby(["_timestamp", "_anomalies"]).cumcount()
+    data["_plot_timestamp"] = data["_timestamp"] + pd.to_timedelta(overlap_rank, unit="s")
+    data["_audit_label"] = data["_timestamp"].dt.strftime("%d %b %Y, %H:%M:%S UTC")
+    data["_filename"] = data.get("filename", pd.Series("N/A", index=data.index)).fillna("N/A")
+    data["_load_lock"] = data.get("load_lock", pd.Series("N/A", index=data.index)).fillna("N/A")
+    data["_pipeline"] = data.get("pipeline_status", pd.Series("N/A", index=data.index)).fillna("N/A")
+    data["_verdict"] = data.get("verdict", pd.Series("N/A", index=data.index)).fillna("N/A")
+    scores = pd.to_numeric(data.get("score", pd.Series(pd.NA, index=data.index)), errors="coerce")
+    data["_score"] = scores.map(lambda value: "N/A" if pd.isna(value) else f"{value:.2f}")
+
+    fig = go.Figure()
+    outcome_order = ["ACCEPTED", "WARNING", "REJECTED", "INCOMPLETE"]
+    remaining = [value for value in data["_outcome"].unique() if value not in outcome_order]
+    for outcome in [*outcome_order, *remaining]:
+        subset = data[data["_outcome"] == outcome]
+        if subset.empty:
+            continue
+        customdata = list(
+            zip(
+                subset["_filename"], subset["_load_lock"], subset["_audit_label"],
+                subset["_pipeline"], subset["_verdict"], subset["_score"],
+            )
         )
-    )
+        fig.add_trace(
+            go.Scatter(
+                x=subset["_plot_timestamp"],
+                y=subset["_anomalies"],
+                name=outcome.title(),
+                mode="markers",
+                marker=dict(
+                    size=10,
+                    color=OUTCOME_COLORS.get(outcome, SLATE),
+                    opacity=0.88,
+                    line=dict(color="white", width=1.5),
+                ),
+                customdata=customdata,
+                hovertemplate=(
+                    "File: %{customdata[0]}<br>"
+                    "LOAD_LOCK: %{customdata[1]}<br>"
+                    "Audit time: %{customdata[2]}<br>"
+                    "Anomalies: %{y:,.0f}<br>"
+                    "Pipeline status: %{customdata[3]}<br>"
+                    "Judge verdict: %{customdata[4]}<br>"
+                    "Quality score: %{customdata[5]}<extra></extra>"
+                ),
+            )
+        )
     fig.update_xaxes(title="Audit time (UTC)", tickformat="%d %b\n%H:%M")
     fig.update_yaxes(title="Anomalies detected", rangemode="tozero")
-    return _layout(fig, height=250)
+    fig.update_layout(legend=dict(orientation="h", y=1.06, x=0))
+    return _layout(fig, height=260, show_legend=True)
+
+
+def agent_detections_by_audit(frame: pd.DataFrame) -> go.Figure:
+    """One marker for one persisted agent count in one audit record."""
+    fig = go.Figure()
+    extra_agents = list(
+        dict.fromkeys(str(value) for value in frame.get("agent", []) if value not in AGENT_COLORS)
+    )
+    for agent in [*AGENT_COLORS, *extra_agents]:
+        subset = frame[frame["agent"] == agent].sort_values("audit_time")
+        if subset.empty:
+            continue
+        audit_labels = pd.to_datetime(subset["audit_time"], utc=True).dt.strftime(
+            "%d %b %Y, %H:%M:%S UTC"
+        )
+        customdata = list(
+            zip(
+                subset["filename"].fillna("N/A"),
+                subset["load_lock"].fillna("N/A"),
+                audit_labels,
+                subset["agent_status"].fillna("UNKNOWN"),
+                subset["verdict"].fillna("N/A"),
+                subset["pipeline_status"].fillna("N/A"),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=subset["audit_time"],
+                y=subset["detections"],
+                name=str(agent),
+                mode="markers",
+                marker=dict(
+                    size=9,
+                    color=AGENT_COLORS.get(str(agent), SLATE),
+                    opacity=0.86,
+                    line=dict(color="white", width=1.25),
+                ),
+                customdata=customdata,
+                hovertemplate=(
+                    "Agent: " + str(agent) + "<br>"
+                    "File: %{customdata[0]}<br>"
+                    "LOAD_LOCK: %{customdata[1]}<br>"
+                    "Audit time: %{customdata[2]}<br>"
+                    "Detections: %{y:,.0f}<br>"
+                    "Agent status: %{customdata[3]}<br>"
+                    "Judge verdict: %{customdata[4]}<br>"
+                    "Pipeline status: %{customdata[5]}<extra></extra>"
+                ),
+            )
+        )
+    fig.update_xaxes(title="Audit time (UTC)", tickformat="%d %b\n%H:%M")
+    fig.update_yaxes(title="Detections", rangemode="tozero")
+    fig.update_layout(legend=dict(orientation="h", y=1.06, x=0))
+    return _layout(fig, height=260, show_legend=True)
 
 
 def stacked_horizontal(

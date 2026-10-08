@@ -13,11 +13,12 @@ from dashboard.components import (
     format_optional_number,
     format_short_run_id,
     is_missing,
+    render_compact_info_grid,
     render_empty_state,
-    render_info_grid,
-    render_metric_card,
+    render_metric_grid,
     render_page_header,
     render_timeline_notice,
+    style_status_columns,
 )
 from dashboard.transformations import (
     aggregate_agent_counts,
@@ -42,9 +43,7 @@ def _metric_grid(metrics: dict) -> None:
         ("Quarantine Events", format_optional_number(metrics["quarantine_events"]), "Historical events"),
         ("Historical Detections", format_optional_number(metrics["historical_detections"]), "Across audit records"),
     ]
-    for column, (label, value, helper) in zip(st.columns(6), items):
-        with column:
-            render_metric_card(label, value, helper=helper)
+    render_metric_grid(items)
 
 
 def _quality_timeline(files_df: pd.DataFrame) -> pd.Series:
@@ -115,12 +114,16 @@ def render(
             ("Outcome", "—" if is_missing(outcome) else str(outcome)),
             ("Score", "—" if is_missing(latest.get("score")) else format_optional_number(latest.get("score"), 2)),
             ("Anomalies", format_optional_number(latest.get("anomalies_total"))),
-            ("Duration", format_duration(duration)),
-            ("Audit time", format_datetime(latest.get("timestamp"))),
         ]
         severity_summary = _severity_summary(latest, severity_df)
         if severity_summary:
-            latest_items.append(("Severity summary", severity_summary))
+            latest_items.append(("Severity", severity_summary))
+        latest_items.extend(
+            [
+                ("Duration", format_duration(duration)),
+                ("Audit time", format_datetime(latest.get("timestamp"))),
+            ]
+        )
         if not is_missing(outcome) and str(outcome).upper() == "INCOMPLETE":
             latest_items.append(
                 (
@@ -133,7 +136,7 @@ def render(
                 )
             )
         with st.container(border=True):
-            render_info_grid(latest_items)
+            render_compact_info_grid(latest_items)
 
     left, right = st.columns(2)
     with left:
@@ -197,7 +200,10 @@ def render(
         recent["Files"] = pd.to_numeric(recent["files_processed"], errors="coerce")
         recent["Duration"] = recent["duration_seconds"].map(format_duration)
         st.dataframe(
-            recent[["Run", "Started", "Duration", "Files", "Execution Status"]],
+            style_status_columns(
+                recent[["Run", "Started", "Duration", "Files", "Execution Status"]],
+                ["Execution Status"],
+            ),
             hide_index=True,
             use_container_width=True,
         )
