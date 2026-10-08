@@ -263,9 +263,11 @@ python -m reporting.agent_reporting consolide [dossier_resultats]
   `LocalLoader`, mais télécharge depuis S3 avec cache local — utilisé au
   déploiement AWS uniquement.
 - **`test_s3_connexion.py`** : diagnostic de connexion S3 avant déploiement.
-- **`profiling.py`** : génère `resultats/inventaire.csv`, un inventaire de
-  tous les fichiers de `DATA_DIR` (colonnes, taille, langue probable) à
-  titre purement informatif — jamais utilisé pour unifier les schémas.
+- **`profiling.py`** : génère `resultats/inventaire.csv` (colonnes, taille,
+  langue probable). En exécution autonome, il inventorie `DATA_DIR`; depuis
+  l'orchestrateur, il utilise le loader actif LOCAL/S3 et uniquement la
+  sélection du run. Cet inventaire reste purement informatif — jamais utilisé
+  pour unifier les schémas.
 
 ```powershell
 python -m ingestion.profiling
@@ -318,8 +320,10 @@ python -m pytest -q
   `stats_*.json`, `realisme_*.json`, `verdict_*.json`, `rapport_*.html`,
   `inventaire.csv`) — régénérées à chaque exécution, jamais commitées.
 - **`cache_llm/`** : cache disque des réponses LLM (évite de repayer une
-  requête identique) et compteur de quota quotidien
-  (`compteur_quotidien.json`). État d'exécution local, jamais commité.
+  requête identique) et compteurs de quota quotidien par clé sous
+  `quota/compteur_<fingerprint>.json`. État d'exécution local, jamais commité.
+  Le fingerprint est formé des 12 premiers caractères hexadécimaux du SHA-256
+  de la clé ; la clé elle-même n'est ni stockée ni journalisée.
 
 ## Installation pour un nouveau membre
 
@@ -358,16 +362,20 @@ python -m pytest -q
 
 ## Contraintes importantes à connaître avant de lancer un run réel
 
-- **Quota LLM partagé, désormais beaucoup plus tendu** :
-  `config.RATE_LIMIT["max_requetes_jour"] = 45`, partagé par tout le projet
-  (Cohérence et Réalisme ; le Judge est déterministe). Un appel LLM peut prendre de 30 secondes à
+- **Quota LLM par clé, désormais beaucoup plus tendu** :
+  `config.RATE_LIMIT["max_requetes_jour"] = 45` pour chaque clé OpenRouter,
+  partagé par Cohérence et Réalisme lorsqu'ils utilisent cette même clé ; le
+  Judge est déterministe. Un appel LLM peut prendre de 30 secondes à
   plusieurs minutes sur le tier gratuit. Depuis l'ajout de Cohérence (traite
   tout le fichier, pas juste les lignes suspectes) et de la vérification web
   de Réalisme (un appel de plus par chunk), **un seul gros fichier peut
   épuiser le quota du jour à lui seul** — envisager l'achat unique de 10$
   sur OpenRouter (45 → 1000 requêtes/jour) si des runs plus larges sont
   nécessaires. `agents.llm_client.quota_restant()` donne le solde du jour ;
-  `orchestrateur.main()` s'arrête proprement quand il atteint 0.
+  `orchestrateur.main()` s'arrête proprement quand il atteint 0. Changer de
+  clé sélectionne automatiquement un compteur distinct. L'ancien
+  `cache_llm/compteur_quotidien.json` est ignoré et peut être supprimé
+  manuellement ; les caches de réponses existants restent inchangés.
 - **Fichiers de même nom dans des mois différents** : plusieurs fichiers
   `data/LOAD_LOCK_*/` portent le même nom (ex. `NL_B2B_BRO_OFF.xlsx` existe
   dans 3 dossiers mensuels). `orchestrateur.py` traite chaque copie

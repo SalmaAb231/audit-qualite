@@ -214,7 +214,8 @@ déploiement AWS uniquement) exposent la même interface publique, ce qui
 rend le reste du pipeline agnostique du support de stockage.
 `profiling.py` génère `resultats/inventaire.csv` à titre purement
 informatif — jamais utilisé pour unifier les schémas (voir "schema-agnostic"
-ci-dessus).
+ci-dessus). Son usage autonome parcourt `DATA_DIR`; l'orchestrateur lui passe
+le loader LOCAL/S3 actif et la sélection exacte du run.
 
 ### Dossiers non versionnés (`.gitignore`)
 
@@ -224,18 +225,23 @@ ci-dessus).
 - **`resultats/`** : toutes les sorties générées (`verdict_*.json`,
   `rapport_*.html`, `inventaire.csv`, etc.) — régénérées à chaque
   exécution, jamais commitées.
-- **`cache_llm/`** : cache disque des réponses LLM et compteur de quota
-  quotidien (`compteur_quotidien.json`) — état d'exécution local, jamais
-  commité.
+- **`cache_llm/`** : cache disque des réponses LLM et compteurs de quota
+  quotidien isolés par clé sous `quota/compteur_<fingerprint>.json` — état
+  d'exécution local, jamais commité. Le fingerprint est constitué des 12
+  premiers caractères hexadécimaux du SHA-256 de la clé ; aucun secret n'est
+  stocké dans le fichier ou son nom.
 
 ## Contraintes à connaître avant de lancer un run réel
 
-- **Quota LLM partagé, très tendu** :
-  `config.RATE_LIMIT["max_requetes_jour"] = 45` requêtes/jour, partagé par
-  Cohérence et Réalisme. Le Judge est déterministe. Cohérence seule (tout le fichier, en
+- **Quota LLM par clé, très tendu** :
+  `config.RATE_LIMIT["max_requetes_jour"] = 45` requêtes/jour pour chaque clé,
+  partagé par Cohérence et Réalisme lorsqu'ils utilisent la même clé. Le Judge
+  est déterministe. Cohérence seule (tout le fichier, en
   chunks) peut coûter plusieurs dizaines de requêtes par fichier : un seul
   gros fichier peut épuiser le quota du jour sur un run multi-fichiers.
-  `agents.llm_client.quota_restant()` donne le solde restant.
+  `agents.llm_client.quota_restant()` donne le solde de la clé configurée.
+  L'ancien `cache_llm/compteur_quotidien.json` est ignoré et peut être supprimé
+  manuellement sans toucher aux caches de réponses.
 - **Un même nom de fichier peut exister dans plusieurs dossiers mensuels** —
   lancer un module directement par nom de fichier (ex.
   `python -m structure.agent_structure <nom>`) résout systématiquement vers

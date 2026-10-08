@@ -25,6 +25,10 @@ import config
 from ingestion.local_loader import FichierInfo, LocalLoader
 
 
+class S3OperationError(RuntimeError):
+    """Échec S3 explicite pour les opérations génériques du dashboard."""
+
+
 class S3Loader:
     """
     Accès aux fichiers de données stockés sur S3, avec cache local des
@@ -142,6 +146,68 @@ class S3Loader:
         logger.info(f"{len(fichiers)} fichier(s) de données trouvé(s) sur s3://{self.bucket}/{self.prefix}")
         return fichiers
 
+    def lister_cles(self, prefixe: str) -> list[str]:
+        """Liste les clés non-dossier d'un préfixe S3 générique."""
+        if not self.bucket:
+            logger.error("Aucun bucket S3 configuré : impossible de lister les objets.")
+            raise S3OperationError("S3 bucket is not configured")
+
+        cles: list[str] = []
+        try:
+            paginateur = self._s3.get_paginator("list_objects_v2")
+            for page in paginateur.paginate(Bucket=self.bucket, Prefix=prefixe):
+                cles.extend(
+                    objet["Key"]
+                    for objet in page.get("Contents", [])
+                    if not objet["Key"].endswith("/")
+                )
+        except NoCredentialsError:
+            logger.error("Credentials AWS manquants ou invalides : listing S3 impossible.")
+            raise S3OperationError(
+                f"S3 listing failed for bucket={self.bucket!r}, prefix={prefixe!r}: missing credentials"
+            )
+        except ClientError as erreur:
+            code = erreur.response.get("Error", {}).get("Code", "?")
+            logger.error(f"Erreur S3 lors du listing de '{prefixe}' (code={code}) : {erreur}")
+            raise S3OperationError(
+                f"S3 listing failed for bucket={self.bucket!r}, prefix={prefixe!r}, code={code}"
+            ) from erreur
+        except BotoCoreError as erreur:
+            logger.error(f"Erreur boto3 lors du listing de '{prefixe}' : {erreur}")
+            raise S3OperationError(
+                f"S3 listing failed for bucket={self.bucket!r}, prefix={prefixe!r}"
+            ) from erreur
+        return cles
+
+    def lire_objet(self, cle: str) -> bytes:
+        """Lit un objet S3 en mémoire, sans l'écrire dans le cache de données."""
+        if not self.bucket:
+            logger.error("Aucun bucket S3 configuré : lecture d'objet impossible.")
+            raise S3OperationError("S3 bucket is not configured")
+        try:
+            reponse = self._s3.get_object(Bucket=self.bucket, Key=cle)
+            return reponse["Body"].read()
+        except NoCredentialsError:
+            logger.error(f"Credentials AWS manquants ou invalides : lecture de '{cle}' impossible.")
+            raise S3OperationError(
+                f"S3 object read failed for bucket={self.bucket!r}, key={cle!r}: missing credentials"
+            )
+        except ClientError as erreur:
+            code = erreur.response.get("Error", {}).get("Code", "?")
+            logger.error(f"Objet S3 inaccessible '{cle}' (code={code}) : {erreur}")
+            raise S3OperationError(
+                f"S3 object read failed for bucket={self.bucket!r}, key={cle!r}, code={code}"
+            ) from erreur
+        except BotoCoreError as erreur:
+            logger.error(f"Erreur boto3 lors de la lecture de '{cle}' : {erreur}")
+            raise S3OperationError(
+                f"S3 object read failed for bucket={self.bucket!r}, key={cle!r}"
+            ) from erreur
+
+    def chemin_cache(self, cle: str) -> Path:
+        """Retourne le chemin local du cache correspondant à une clé S3."""
+        return config.CACHE_DIR / str(cle)
+
     def charger(self, cle: str) -> pd.DataFrame | None:
         """
         Télécharge (si nécessaire) puis charge un fichier S3 dans un DataFrame.
@@ -172,7 +238,7 @@ class S3Loader:
             return None
 
         taille_distante = entete["ContentLength"]
-        chemin_cache = config.CACHE_DIR / cle
+        chemin_cache = self.chemin_cache(cle)
 
         if chemin_cache.exists() and chemin_cache.stat().st_size == taille_distante:
             logger.info(f"Fichier déjà en cache (même taille), téléchargement ignoré : {cle}")
@@ -189,8 +255,8 @@ class S3Loader:
 
     def uploader(self, chemin_local: Path, cle_s3: str) -> bool:
         """
-        Dépose un fichier local sur S3 (utilisé plus tard par le module
-        reporting/ pour publier les rapports générés). Retourne True en cas
+        Dépose un fichier local sur S3 (utilisé par l'orchestrateur pour
+        publier les rapports et copier les sources en quarantaine). Retourne True en cas
         de succès, False sinon (journalisé), sans jamais lever d'exception.
         """
         chemin_local = Path(chemin_local)
