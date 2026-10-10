@@ -5,8 +5,8 @@ automobile (location longue durée de véhicules). Chaque fichier passe par
 une série de détecteurs indépendants qui produisent des **anomalies** dans
 un format JSON commun, agrégées ensuite en un **verdict** par fichier
 (`ACCEPTED` / `WARNING` / `REJECTED`) puis mises en forme dans des
-**rapports HTML**. Déploiement futur sur AWS (S3 + EC2) ; développement et
-tests actuels en local.
+**rapports HTML**. Le mode local est utilisé pour le développement ; le mode
+S3 est disponible pour un déploiement sur AWS EC2 avec un rôle IAM.
 
 Un quatrième état technique, `INCOMPLETE`, est utilisé lorsqu'une étape LLM
 obligatoire n'a pas terminé. Ce n'est pas un verdict qualité : dans ce cas le
@@ -274,6 +274,19 @@ python -m ingestion.profiling
 python -m ingestion.test_s3_connexion
 ```
 
+### Stockage S3 et traçabilité
+
+En mode `STORAGE_MODE=s3`, les entrées sont lues sous `input/`. Les rapports
+et verdicts sont écrits sous `reports/runs/<run_id>/`, tandis que l'historique
+immuable est écrit sous `history/runs/YYYY/MM/DD/<run_id>.json`. Les fichiers
+`REJECTED` ou `INCOMPLETE` sont copiés sous `quarantine/`. Le dashboard relit
+l'historique et les artefacts via le même bucket ; il ne rend aucun objet S3
+public.
+
+Le bucket de référence documenté pour le déploiement est
+`audit-qualite-leasing-pfa-hn-2026-01-239280167189-eu-west-1-an`. Le code accepte aussi
+un autre bucket via `S3_BUCKET`.
+
 ### `docs/`
 
 - **`contrat_anomalie.md`** : le format JSON commun décrit plus haut, avec
@@ -398,4 +411,4 @@ python -m pytest -q
 | Judge | ✅ Implémenté, testé, calibré |
 | Reporting | ✅ Implémenté (HTML), testé |
 | Orchestrateur | ✅ Implémenté, testé — pipeline complet de bout en bout |
-| Dépôt S3 des rapports (`config.S3_REPORTS_PREFIX`) | ❌ Pas encore implémenté |
+| Dépôt S3 des rapports (`config.S3_REPORTS_PREFIX`) | ✅ Implémenté en mode S3, sous `reports/runs/<run_id>/` |
