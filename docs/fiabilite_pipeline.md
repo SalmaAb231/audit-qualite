@@ -55,6 +55,19 @@ SHA256(source_path + "|" + content_hash + "|" + checkpoint_version)
 Le JSON de checkpoint conserve aussi ces trois informations en clair afin de
 faciliter le diagnostic.
 
+En mode S3, `source_path` est la clé de l'objet et le hash concerne les octets
+du fichier téléchargé dans le cache local. Avant réutilisation, le chargeur
+compare bucket, clé, ETag, VersionId, LastModified et taille avec son sidecar
+`.s3-cache.json`, puis vérifie le SHA-256 local. Un remplacement de même taille
+déclenche donc un téléchargement si l'identité distante change. Le GET utilise
+`IfMatch` et la réponse doit correspondre à l'identité observée, VersionId inclus.
+Il lit l'objet courant sans demander une ancienne version : la permission
+existante `s3:GetObject` suffit, sans imposer `s3:GetObjectVersion`.
+Une différence entre HEAD et GET ou un téléchargement incomplet fait échouer
+le chargement ; l'ancien cache n'est pas analysé comme solution de repli.
+Un cache ancien sans sidecar valide est téléchargé à nouveau. Les checkpoints
+restent locaux ; ils ne sont pas écrits dans S3.
+
 À la reprise :
 
 - un chunk enregistré avec `metadata.succes=true` est réutilisé sans nouvel
@@ -76,10 +89,18 @@ chunks Cohérence déjà réussis sont récupérés.
 
 1. recherche d'une réponse identique dans `cache_llm/` ;
 2. appel du premier modèle configuré pour l'agent ;
-3. jusqu'à `RATE_LIMIT["retries_max"]` nouveaux essais avec backoff
-   exponentiel pour les erreurs transitoires et les JSON invalides ;
-4. passage aux modèles suivants de la cascade ;
-5. dernier recours avec `MODELE_FALLBACK`, sauf quota épuisé.
+3. au plus un retry court par modèle pour certaines erreurs réseau, serveur
+   ou de réponse/JSON, avec `FREE_TIER_RETRY_BACKOFF_SECONDS` ;
+4. passage immédiat au modèle suivant pour les erreurs permanentes ou les
+   limites upstream ; un circuit breaker écarte un modèle après deux limites
+   upstream pendant 300 secondes ;
+5. dernier recours avec `MODELE_FALLBACK` si le quota et le budget le permettent.
+
+Toutes les tentatives réseau et changements de modèle partagent un plafond
+de `MAX_LLM_ATTEMPTS_PER_CHUNK=4`. La cascade et le fallback ne sont donc pas
+nécessairement parcourus entièrement. Réalisme utilise seulement le budget
+restant du chunk pour sa vérification web. Les anciennes valeurs
+`RATE_LIMIT["retries_max"]` / `backoff_initial` ne pilotent pas ce mécanisme actuel.
 
 Chaque tentative réseau réelle consomme le compteur quotidien. Une réponse
 issue du cache n'en consomme aucune. Les avertissements « JSON invalide » ou

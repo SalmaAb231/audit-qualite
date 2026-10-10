@@ -64,9 +64,9 @@ optionnelles, au-delà du contrat de `analyser()` :
 
 `orchestrateur.py` ajoute `"dossier_mois"` au verdict ; le Judge fournit déjà
 le détail des problèmes avant la sauvegarde et la construction du rapport
-consolidé. La CLI autonome du Judge conserve elle aussi ce détail,
-mais ne peut connaître le mois d'origine que si cette information figure dans
-son entrée.
+consolidé. La CLI autonome du Judge conserve elle aussi ce détail, mais ne
+retransmet pas `dossier_mois` dans sa sortie : utiliser les verdicts enrichis
+du pipeline pour conserver le mois d'origine dans les rapports.
 
 ## Analyses incomplètes
 

@@ -3,13 +3,15 @@
 Ce document liste les vérifications effectuées par `stats/agent_stats.py`,
 le deuxième détecteur du pipeline d'audit. Il juge la **plausibilité
 statistique des valeurs**, jamais la forme du fichier (rôle de `structure/`)
-ni la cohérence métier au sens large (rôle futur des agents LLM Cohérence et
+ni la cohérence métier au sens large (rôle des agents LLM Cohérence et
 Réalisme) — sauf le check 5, qui capture mathématiquement un cas particulier
 d'incohérence métier détectable sans connaître le sens des colonnes.
 
 Toutes les anomalies produites ont `type: "statistique"` et `source: "stats"`
-(détection déterministe, sans LLM). Convention sur le champ `ligne` : `0`
-signifie que l'anomalie concerne une colonne entière, pas une ligne précise.
+(détection déterministe, sans LLM). Certaines anomalies historiques globales
+utilisent `ligne=0`, mais 0 peut aussi être l'index réel de la première ligne.
+Ne pas déduire une portée colonne de ce nombre seul : consulter les métadonnées
+de portée et de traçabilité, et signaler une localisation ambiguë si nécessaire.
 
 ## `verifier_outliers_numeriques`
 

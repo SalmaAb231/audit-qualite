@@ -27,7 +27,7 @@ définitif :
    chaque fichier 3 fois — triplant la consommation de requêtes LLM sans
    que ce soit visible dans les logs — et surtout **écrasé** les résultats
    entre les mois (même nom de fichier de sortie). Solution : un
-   sous-dossier `resultats/<dossier_mois>/` par mois (voir
+   sous-dossier `resultats/runs/<run_id>/<dossier_mois>/` par run et mois (voir
    `_sauvegarder_resultats_fichier`), et le comportement "toutes les copies
    mensuelles d'un nom" est documenté explicitement plutôt qu'implicite.
 3. **Appeler Réalisme sur tout le fichier contredit l'architecture déjà
@@ -38,7 +38,7 @@ définitif :
 ## Sélection des lignes envoyées à Réalisme (`_lignes_suspectes`)
 
 Réalisme reçoit : les lignes explicitement pointées par une anomalie de
-`structure/` ou `stats/` (champ `ligne`, **y compris `ligne=0`**) + un
+`structure/`, `stats/` ou Cohérence (champ `ligne`, **y compris `ligne=0`**) + un
 échantillon aléatoire de contrôle (`config.TAUX_ECHANTILLON_CONTROLE`, 10%
 par défaut) parmi les lignes restantes, pour repérer des problèmes qu'aucun
 détecteur mathématique n'a signalés.
@@ -139,8 +139,14 @@ conservées pour diagnostic.
 
 ## Ce que ce module ne fait pas
 
-Il n'envoie rien vers S3 (`config.S3_REPORTS_PREFIX`) : tout est écrit en
-local dans `resultats/`. Il ne reprend pas non plus un run interrompu où il
+Il ne provisionne pas l'infrastructure AWS. En mode S3, il publie les rapports
+et verdicts sous `reports/runs/<run_id>/`, l'historique sous
+`history/runs/YYYY/MM/DD/` et copie la source sous `quarantine/<mois>/` pour
+un verdict `REJECTED` ou un statut `INCOMPLETE`. Il conserve aussi les sorties
+locales ; un échec d'upload est journalisé sans modifier automatiquement le
+statut métier. En mode LOCAL, aucune copie de quarantaine dédiée n'est créée.
+
+Il ne reprend pas un run interrompu où il
 s'était arrêté (pas de checkpoint façon "reprendre après le fichier N") :
 chaque exécution reparcourt tout ce qu'on lui donne depuis le début. Cette
 limite ne concerne pas les chunks de Cohérence : leur checkpoint réutilise les

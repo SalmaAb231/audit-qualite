@@ -42,25 +42,26 @@ sans traitement spécifique par source.
 
 ### `type`
 
-- `structure` : non-conformité par rapport au schéma attendu (colonne manquante, type incorrect, format invalide, etc.). Détecté par la couche de validation de structure (pandas).
+- `structure` : problème de forme (fichier vide, noms de colonnes absents/dupliqués, valeurs manquantes, mélange de types, etc.), détecté par pandas sans liste métier de colonnes obligatoires.
 - `statistique` : valeur aberrante ou incohérence détectée par des méthodes statistiques (outliers, distributions anormales, doublons, etc.).
 - `coherence` : incohérence logique ou métier entre plusieurs champs/lignes, détectée par l'agent LLM « Cohérence ».
 - `realisme` : valeur individuellement invraisemblable au regard du métier du renting automobile, détectée par l'agent LLM « Réalisme ».
 
 ### `severite`
 
-- `critical` : bloquant, empêche toute exploitation fiable de la donnée.
+- `critical` : gravité maximale. Le garde Structure arrête les étapes suivantes pour une critical structurelle ; dans le Judge v2, la sévérité seule ne constitue pas une règle bloquante.
 - `high` : erreur importante, à corriger avant utilisation.
 - `medium` : anomalie notable mais n'empêchant pas l'exploitation immédiate.
 - `low` : anomalie mineure ou cosmétique.
 
-Ces niveaux sont pondérés dans `config.py` (`PONDERATION_SEVERITE`) pour
-calculer un score agrégé par fichier ou par lot.
+Le Judge v2 utilise `config.JUDGE_POIDS_SEVERITE` (critical 1, high 0,6,
+medium 0,25, low 0,1). `PONDERATION_SEVERITE` concerne encore le score auxiliaire
+historique de Cohérence ; ce n'est pas le score final du Judge.
 
 ### `source`
 
 - `stats` : anomalie détectée par les couches pandas / statistiques (déterministe, reproductible).
-- `llm` : anomalie détectée par un agent LLM (Cohérence, Réalisme) ou confirmée par le Judge.
+- `llm` : anomalie détectée par un agent LLM (Cohérence, Réalisme). Le Judge est déterministe et ne fait pas de confirmation LLM.
 
 ## Utilisation du score de confiance
 
@@ -68,12 +69,16 @@ Le champ `confiance` (entre 0 et 1) permet au module Judge d'agréger les
 anomalies remontées par les différentes sources en un verdict global par
 fichier, selon les seuils définis dans `config.py` :
 
-- `ACCEPTED` si le score agrégé est `>= 0.90`
-- `WARNING` si le score agrégé est `>= 0.75` (et `< 0.90`)
-- `REJECTED` en dessous de `0.75`
+- `ACCEPTED` si le score sur 100 est `>= 90`, sans blocage ;
+- `WARNING` si `70 <= score < 90`, sans blocage ;
+- `REJECTED` si le score est `< 70` ou si une règle structurelle bloquante est reconnue.
 
-Le détail exact du calcul d'agrégation (moyenne pondérée, minimum, etc.)
-sera défini lors de l'implémentation du module `judge/`.
+La confiance pondère les signalements LLM ; le Judge retient le poids maximal
+par ligne après consolidation des problèmes concordants. Les portées et comptes
+agrégés sans index exacts sont traités comme une couverture estimée.
+Lorsque le pipeline est `INCOMPLETE`, score, grade et verdict qualité restent
+à `null`. Voir [les règles du Judge v2](../judge/regles_judge.md) pour la formule,
+les cas provisoires et les règles bloquantes indépendantes de la sévérité.
 
 ## Enrichissement de traçabilité persisté
 

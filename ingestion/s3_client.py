@@ -1,7 +1,7 @@
 """
 Chargeur de données S3 pour le projet audit-qualite.
 
-Utilisé UNIQUEMENT au déploiement (AWS EC2 + S3). En développement local,
+Utilisé lorsque STORAGE_MODE=s3, sur EC2 ou un PC autorisé. En mode local,
 utiliser ingestion.local_loader.LocalLoader : les deux classes exposent une
 interface publique identique (lister_fichiers, charger), ce qui permet à
 l'orchestrateur de basculer de l'une à l'autre en changeant une seule ligne,
@@ -14,7 +14,12 @@ Aucune autre partie du pipeline ne doit avoir besoin de savoir laquelle des
 deux implémentations est utilisée.
 """
 
+from contextlib import closing
+import hashlib
+import json
 from pathlib import Path
+import shutil
+from tempfile import TemporaryDirectory
 
 import boto3
 import pandas as pd
@@ -27,6 +32,25 @@ from ingestion.local_loader import FichierInfo, LocalLoader
 
 class S3OperationError(RuntimeError):
     """Échec S3 explicite pour les opérations génériques du dashboard."""
+
+
+def _hash_cache(chemin: Path) -> str:
+    empreinte = hashlib.sha256()
+    with chemin.open("rb") as fichier:
+        for bloc in iter(lambda: fichier.read(1024 * 1024), b""):
+            empreinte.update(bloc)
+    return empreinte.hexdigest()
+
+
+def _identite_objet(bucket: str, cle: str, entete: dict) -> dict:
+    return {
+        "bucket": bucket,
+        "key": cle,
+        "size": entete["ContentLength"],
+        "etag": entete.get("ETag"),
+        "version_id": entete.get("VersionId"),
+        "last_modified": str(entete.get("LastModified", "")),
+    }
 
 
 class S3Loader:
@@ -217,8 +241,10 @@ class S3Loader:
         Télécharge (si nécessaire) puis charge un fichier S3 dans un DataFrame.
 
         Le fichier est mis en cache dans config.CACHE_DIR, à l'identique de
-        l'arborescence de la clé S3. Si un fichier de même taille y est déjà
-        présent, le téléchargement est sauté. Retourne None et journalise
+        l'arborescence de la clé S3. Le cache est réutilisé uniquement si son
+        identité S3 et son SHA-256 local correspondent au sidecar enregistré.
+        Le téléchargement conditionnel est publié après validation, sans
+        remplacer le cache précédent en cas d'échec de transfert. Retourne None et journalise
         l'erreur en cas de problème (clé introuvable, credentials invalides,
         fichier corrompu), sans jamais lever d'exception vers l'appelant.
         """
@@ -241,19 +267,53 @@ class S3Loader:
             logger.error(f"Erreur boto3 lors de l'accès à '{cle}' : {erreur}")
             return None
 
-        taille_distante = entete["ContentLength"]
         chemin_cache = self.chemin_cache(cle)
+        chemin_metadata = chemin_cache.with_name(chemin_cache.name + ".s3-cache.json")
+        identite = _identite_objet(self.bucket, cle, entete)
+        if not identite["etag"]:
+            logger.error(f"Identité ETag S3 absente, chargement annulé : {cle}")
+            return None
 
-        if chemin_cache.exists() and chemin_cache.stat().st_size == taille_distante:
-            logger.info(f"Fichier déjà en cache (même taille), téléchargement ignoré : {cle}")
-        else:
+        try:
             try:
+                metadata = json.loads(chemin_metadata.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                metadata = {}
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("identity") == identite
+                and chemin_cache.is_file()
+                and chemin_cache.stat().st_size == identite["size"]
+                and metadata.get("sha256") == _hash_cache(chemin_cache)
+            ):
+                logger.info(f"Fichier déjà en cache (identité S3 et SHA-256 validés) : {cle}")
+            else:
                 chemin_cache.parent.mkdir(parents=True, exist_ok=True)
-                self._s3.download_file(self.bucket, cle, str(chemin_cache))
+                options = {"Bucket": self.bucket, "Key": cle, "IfMatch": identite["etag"]}
+                # Lire l'objet courant avec GetObject (sans imposer GetObjectVersion).
+                # Vérifier aussi sa version : même ETag ne suffit pas à associer
+                # une réponse différente du HEAD à son identité.
+                reponse = self._s3.get_object(**options)
+                with closing(reponse["Body"]) as source:
+                    if _identite_objet(self.bucket, cle, reponse) != identite:
+                        raise ValueError("L'objet S3 a changé pendant le téléchargement")
+                    with TemporaryDirectory(dir=chemin_cache.parent) as temporaire:
+                        fichier_temp = Path(temporaire) / "payload"
+                        metadata_temp = Path(temporaire) / "metadata.json"
+                        with fichier_temp.open("wb") as destination:
+                            shutil.copyfileobj(source, destination)
+                        if fichier_temp.stat().st_size != identite["size"]:
+                            raise ValueError("Téléchargement S3 incomplet")
+                        metadata_temp.write_text(
+                            json.dumps({"identity": identite, "sha256": _hash_cache(fichier_temp)}),
+                            encoding="utf-8",
+                        )
+                        fichier_temp.replace(chemin_cache)
+                        metadata_temp.replace(chemin_metadata)
                 logger.info(f"Téléchargé depuis S3 : s3://{self.bucket}/{cle} -> {chemin_cache}")
-            except (ClientError, BotoCoreError) as erreur:
-                logger.error(f"Échec du téléchargement de '{cle}' : {erreur}")
-                return None
+        except (ClientError, BotoCoreError, OSError, ValueError) as erreur:
+            logger.error(f"Échec de validation ou téléchargement de '{cle}' : {erreur}")
+            return None
 
         return self._loader_local.charger(chemin_cache)
 

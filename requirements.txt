@@ -1,12 +1,13 @@
 pandas
 openpyxl
+xlrd
 numpy
 requests
 python-dotenv
 loguru
 boto3
+botocore
 tqdm
-langdetect
 tabulate
 pytest
 ddgs

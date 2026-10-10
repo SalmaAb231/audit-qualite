@@ -18,13 +18,14 @@ cache_llm/
 
 # Logs d'exécution
 *.log
+logs/
 
 # Fichiers Excel isolés à la racine (au cas où)
 *.xlsx
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 .pytest_tmp*/
 .venv/
@@ -33,3 +34,9 @@ venv/
 # Environnements / IDE
 .vscode/
 .idea/
+
+# Clés privées et configuration de production
+*.pem
+audit-qualite.env
+.aws/
+.streamlit/secrets.toml

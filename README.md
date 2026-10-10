@@ -5,8 +5,10 @@ automobile (location longue durée de véhicules). Chaque fichier passe par
 une série de détecteurs indépendants qui produisent des **anomalies** dans
 un format JSON commun, agrégées ensuite en un **verdict** par fichier
 (`ACCEPTED` / `WARNING` / `REJECTED`) puis mises en forme dans des
-**rapports HTML**. Déploiement futur sur AWS (S3 + EC2) ; développement et
-tests actuels en local.
+**rapports HTML**. Le projet prend en charge un stockage LOCAL ou S3,
+un dashboard Streamlit et un déploiement AWS EC2 + Docker + ECR + Nginx.
+Les ressources de l'installation AWS sont documentées dans [DEPLOYMENT.md](DEPLOYMENT.md) ;
+leur état distant doit être vérifié sur l'infrastructure.
 
 Un quatrième état technique, `INCOMPLETE`, est utilisé lorsqu'une étape LLM
 obligatoire n'a pas terminé. Ce n'est pas un verdict qualité : dans ce cas le
@@ -75,22 +77,31 @@ C'est ce contrat commun qui permet à `judge/` d'agréger les anomalies de
 tous les détecteurs sans traitement spécifique par source, et à
 `reporting/` de les afficher de façon uniforme.
 
+Le Judge normalise et consolide ces signalements. Le verdict distingue les
+signalements bruts, les problèmes consolidés et les lignes affectées ; il
+conserve les signalements originaux et les métadonnées de portée/provenance.
+`history/anomaly_traceability.py` enrichit ensuite les anomalies avec leur
+identifiant, leur run et leur localisation dans la source lorsqu'elle est connue.
+
 ## Structure détaillée du projet
 
 ### `config.py` (racine)
 
-Configuration centralisée : **tout seuil, tout chemin, tout paramètre LLM
-passe par ce fichier**, jamais codé en dur dans un module. Contient
-notamment :
+Configuration des chemins, du stockage, des paramètres LLM et du Judge.
+Certains seuils propres aux détecteurs restent définis dans leurs modules.
+Contient notamment :
 - `DATA_DIR`, `RESULTATS_DIR`, `CACHE_LLM_DIR` : chemins.
 - `MODELES`, `TEMPERATURES`, `MAX_TOKENS` : un jeu de modèles OpenRouter par
   agent (avec cascade de fallback), tous `:free`.
 - `RATE_LIMIT`, `CHUNK_SIZE`, `MAX_LIGNES_PAR_FICHIER`,
   `TAUX_ECHANTILLON_CONTROLE` : contraintes du tier gratuit OpenRouter et
   découpage des données envoyées aux agents LLM.
-- `PONDERATION_SEVERITE`, `FACTEUR_PENALITE_CRITICAL`, `SEUILS_GRADE`,
-  `PLAFOND_PENALITE_NON_BLOQUANTE`, `SEUIL_ACCEPTED`, `SEUIL_WARNING` :
-  tout ce qui sert au calcul du score/grade/verdict dans `judge/`.
+- `JUDGE_POIDS_SEVERITE`, `JUDGE_SEUILS_GRADE`, `JUDGE_SEUIL_ACCEPTED`,
+  `JUDGE_SEUIL_WARNING`, `JUDGE_SIMILARITE_COLONNES` et
+  `JUDGE_SIMILARITE_PROBLEME` : paramètres du Judge v2.
+- `PONDERATION_SEVERITE` : poids historiques encore utilisés par Cohérence.
+  Les autres anciens paramètres du Judge sont conservés pour compatibilité ;
+  ils ne pilotent plus son score v2.
 
 ### `orchestrateur.py` (racine)
 
@@ -103,9 +114,9 @@ déjà calculées, sans recharger le fichier ni revérifier son exploitabilité)
 cohérence, plus un échantillon de contrôle) → `agent_realisme` → `judge/` →
 `reporting/`. Les deux agents LLM remontent `SUCCESS`, `PARTIAL` ou `FAILED` ;
 si une étape obligatoire reste incomplète (quota ou erreur), le Judge ne
-produit ni verdict qualité ni score. Un dossier de résultats séparé par mois d'origine
-(`resultats/LOAD_LOCK_AAAAMM/`) évite toute collision entre deux fichiers de
-même nom dans des mois différents. Détails et décisions de conception dans
+produit ni verdict qualité ni score. Les résultats individuels sont versionnés
+par run et mois d'origine (`resultats/runs/<run_id>/<LOAD_LOCK>/`), avec
+`sans_mois` lorsque le mois n'est pas identifié. Détails et décisions de conception dans
 [`regles_orchestrateur.md`](regles_orchestrateur.md).
 Les garanties de reprise et de propagation des erreurs sont détaillées dans
 [`docs/fiabilite_pipeline.md`](docs/fiabilite_pipeline.md).
@@ -116,7 +127,7 @@ multi-fichiers, le quota gratuit (45/jour) peut s'épuiser sur un seul gros
 fichier — voir « Contraintes importantes » plus bas.
 
 ```powershell
-python -m orchestrateur                          # tous les fichiers de DATA_DIR
+python -m orchestrateur                          # tous les fichiers du stockage actif LOCAL/S3
 python -m orchestrateur NL_B2B_BRO_OFF.xlsx       # fichier(s) nommé(s)
 ```
 
@@ -159,12 +170,15 @@ python -m stats.agent_stats <fichier_ou_chemin>
 
 - **`llm_client.py`** : client HTTP pour l'API OpenRouter, partagé par tous
   les agents LLM (Cohérence, Réalisme, à terme Judge/Reporting). Gère la
-  cascade de modèles (`config.MODELES`), les retries progressifs, le cache
+  cascade de modèles (`config.MODELES`), les retries bornés, le cache
   disque des réponses (`cache_llm/`, pour ne jamais repayer une requête
   identique) et le respect strict du quota gratuit quotidien
   (`quota_restant()`).
-  Un JSON invalide est une erreur retentable : le client applique le backoff,
-  essaie la cascade de modèles puis `openrouter/free` en dernier recours.
+  Un JSON invalide est une erreur retentable. Un budget global de quatre
+  tentatives réseau limite chaque chunk, avec au plus un retry court pour
+  certaines erreurs transitoires. Les erreurs permanentes passent au modèle
+  suivant ; un circuit breaker écarte temporairement les modèles en limite
+  upstream. `openrouter/free` est un dernier recours si le budget le permet.
 - **`parse_utils.py`** : extraction robuste de JSON depuis une réponse LLM
   (qui peut être mal formée, tronquée, entourée de texte) et validation de
   chaque anomalie contre le contrat commun.
@@ -220,10 +234,14 @@ python -m agents.agent_realisme <fichier_ou_chemin>
 - **`agent_judge.py`** : ne détecte rien, agrège les anomalies déjà
   produites par tous les détecteurs et calcule un score (0 à 100), un grade
   (A à F) et un verdict (`ACCEPTED`/`WARNING`/`REJECTED`), 100%
-  déterministe. Une anomalie `critical`/`high` pèse sans limite ; les
-  `medium`/`low` sont plafonnées (`config.PLAFOND_PENALITE_NON_BLOQUANTE`)
-  pour qu'un détecteur purement statistique ne puisse jamais, à lui seul,
-  rejeter un fichier.
+  déterministe. Le Judge consolide les problèmes concordants, puis retient
+  le poids maximal par ligne affectée : critical 1, high 0,6, medium 0,25,
+  low 0,1, multiplié par la confiance pour les signalements LLM.
+  Le score vaut `100 × (1 − pénalité moyenne par ligne)` ; les agrégats sans
+  index exacts sont traités comme une couverture estimée.
+  `ACCEPTED` exige au moins 90, `WARNING` au moins 70 ; en dessous, le fichier
+  est `REJECTED`. Les règles structurelles bloquantes imposent un rejet
+  indépendamment du score. Grades : A ≥ 90, B ≥ 80, C ≥ 70, D ≥ 60, sinon F.
   Il est entièrement déterministe et ne consomme aucun quota LLM. Lorsque
   `pipeline_status="INCOMPLETE"`, il conserve le diagnostic mais ne publie
   aucun score, grade ou verdict qualité.
@@ -234,6 +252,8 @@ python -m agents.agent_realisme <fichier_ou_chemin>
 
 ```powershell
 python -m judge.agent_judge <chemin_json_anomalies>
+# Si le nombre de lignes n'est pas présent dans le JSON :
+python -m judge.agent_judge <chemin_json_anomalies> <nb_lignes_total>
 ```
 
 ### `reporting/` — rapports HTML
@@ -255,13 +275,20 @@ python -m reporting.agent_reporting fichier <chemin_verdict.json>
 python -m reporting.agent_reporting consolide [dossier_resultats]
 ```
 
+La CLI consolidée lit seulement les `verdict_*.json` directement présents dans
+le dossier fourni : elle ne parcourt pas les sous-dossiers de runs/mois.
+Le pipeline crée automatiquement son consolidé pour tous les fichiers du run.
+
 ### `ingestion/` — accès aux fichiers de données
 
 - **`local_loader.py`** (`LocalLoader`) : lit les fichiers depuis `DATA_DIR`
   local (développement).
 - **`s3_client.py`** (`S3Loader`) : même interface publique que
   `LocalLoader`, mais télécharge depuis S3 avec cache local — utilisé au
-  déploiement AWS uniquement.
+  mode S3, sur EC2 ou sur un PC disposant des permissions nécessaires.
+  Le cache vérifie l'identité S3 (bucket, clé, ETag, version, date et taille)
+  ainsi que le SHA-256 local. Une source remplacée à taille identique est
+  téléchargée à nouveau ; un ancien cache sans sidecar valide est rafraîchi.
 - **`test_s3_connexion.py`** : diagnostic de connexion S3 avant déploiement.
 - **`profiling.py`** : génère `resultats/inventaire.csv` (colonnes, taille,
   langue probable). En exécution autonome, il inventorie `DATA_DIR`; depuis
@@ -278,6 +305,48 @@ python -m ingestion.test_s3_connexion
 
 - **`contrat_anomalie.md`** : le format JSON commun décrit plus haut, avec
   le détail des énumérations et l'usage du score de confiance.
+- **`fiabilite_pipeline.md`** : statuts, retries, cache et reprise.
+
+### `history/`, résultats et quarantaine
+
+`history/run_history.py` crée un `run_id` au format `YYYYMMDDTHHMMSSZ_<8 hex>`
+et un document historique par invocation. `history/anomaly_traceability.py`
+enrichit les références et localisations des anomalies.
+
+| Artefact | Local | S3 |
+| --- | --- | --- |
+| Verdict JSON / rapport HTML individuel | `resultats/runs/<run_id>/<mois>/` | `reports/runs/<run_id>/<mois>/` |
+| Consolidé HTML | `resultats/runs/<run_id>/rapport_consolide.html` | `reports/runs/<run_id>/rapport_consolide.html` |
+| Historique JSON | `resultats/history/runs/YYYY/MM/DD/<run_id>.json` | `history/runs/YYYY/MM/DD/<run_id>.json` |
+| Copie en quarantaine | Pas de copie locale dédiée | `quarantine/<mois>/<nom_fichier>` |
+
+La quarantaine copie la source en mode S3 si le verdict est `REJECTED` ou si
+`pipeline_status == "INCOMPLETE"`, sans supprimer l'entrée. `WARNING` seul
+ne la déclenche pas. Les copies de quarantaine et le résultat auxiliaire
+`resultats/coherence/<nom_fichier>.json` ne sont pas versionnés par run et
+peuvent être remplacés ; les rapports et historiques ont des chemins par run.
+Les échecs d'upload sont journalisés, sans modifier automatiquement le statut
+métier : vérifier aussi la présence des objets S3.
+
+### `dashboard/` — Streamlit
+
+`app.py` expose Overview, New Audit, Files, Anomalies, Agents, Quarantine et
+Runs. Les agrégats proviennent de history ; les rapports, verdicts détaillés
+et sources sont chargés sur demande. New Audit appelle `executer_audit()` de
+façon synchrone, pour un fichier, une sélection ou un LOAD_LOCK. Il n'y a pas
+d'upload manuel, de worker ni d'annulation intégrés.
+
+```powershell
+python -m streamlit run dashboard/app.py
+```
+
+Voir [dashboard/README.md](dashboard/README.md) pour les modes et caches.
+
+### Docker et déploiement
+
+`Dockerfile`, `.dockerignore`, `.env.example`, `deployment/deploy_ec2.sh` et
+`deployment/.gitattributes` préparent le déploiement EC2 depuis ECR, avec
+Streamlit publié sur localhost derrière Nginx. Voir [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ### `jeu_validation/`
 
@@ -330,7 +399,8 @@ python -m pytest -q
 1. Cloner le dépôt et se placer sur son propre travail (branche personnelle,
    ex. `git checkout -b <prenom>`).
 
-2. Créer un environnement virtuel Python 3.12 et l'activer :
+2. Créer un environnement virtuel Python 3.13, comme l'image Docker, et l'activer
+   (la précédente procédure mentionnait Python 3.12, non validé ici) :
 
    ```powershell
    python -m venv .venv
@@ -344,7 +414,9 @@ python -m pytest -q
    ```
 
 4. Créer son propre `.env` à partir du modèle, puis renseigner **sa propre**
-   clé `OPENROUTER_API_KEY` (personnelle, à ne jamais commiter) :
+   clé `OPENROUTER_API_KEY` (personnelle, à ne jamais commiter). Pour cette
+   installation locale, remplacer `STORAGE_MODE=s3` par `STORAGE_MODE=local`
+   dans le fichier privé ; le modèle est orienté déploiement S3 :
 
    ```powershell
    copy .env.example .env
@@ -370,8 +442,10 @@ python -m pytest -q
   tout le fichier, pas juste les lignes suspectes) et de la vérification web
   de Réalisme (un appel de plus par chunk), **un seul gros fichier peut
   épuiser le quota du jour à lui seul** — envisager l'achat unique de 10$
-  sur OpenRouter (45 → 1000 requêtes/jour) si des runs plus larges sont
-  nécessaires. `agents.llm_client.quota_restant()` donne le solde du jour ;
+  sur OpenRouter si des runs plus larges sont nécessaires, après vérification
+  des limites en vigueur. Le plafond du code reste **45** tant que
+  `RATE_LIMIT["max_requetes_jour"]` n'est pas ajusté ; l'achat ne le change pas.
+  `agents.llm_client.quota_restant()` donne le solde du jour ;
   `orchestrateur.main()` s'arrête proprement quand il atteint 0. Changer de
   clé sélectionne automatiquement un compteur distinct. L'ancien
   `cache_llm/compteur_quotidien.json` est ignoré et peut être supprimé
@@ -398,4 +472,12 @@ python -m pytest -q
 | Judge | ✅ Implémenté, testé, calibré |
 | Reporting | ✅ Implémenté (HTML), testé |
 | Orchestrateur | ✅ Implémenté, testé — pipeline complet de bout en bout |
-| Dépôt S3 des rapports (`config.S3_REPORTS_PREFIX`) | ❌ Pas encore implémenté |
+| Dépôt S3 des rapports (`config.S3_REPORTS_PREFIX`) | ✅ Implémenté, versionné par run |
+| Historique / traçabilité / quarantaine S3 | ✅ Implémentés |
+| Dashboard Streamlit | ✅ Sept pages, modes LOCAL/S3, New Audit synchrone |
+| Déploiement EC2 / Docker / ECR / Nginx | Procédure et script disponibles ; infrastructure à valider séparément |
+
+## Déploiement AWS
+
+La procédure complète du déploiement AWS EC2 + Docker + ECR + S3 + Nginx
+est disponible dans [DEPLOYMENT.md](DEPLOYMENT.md).

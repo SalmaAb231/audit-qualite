@@ -1,0 +1,2 @@
+# Conserver les fins de ligne Linux lors des futurs checkouts Windows.
+*.sh text eol=lf

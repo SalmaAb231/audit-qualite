@@ -2,7 +2,7 @@
 
 Le dashboard Streamlit fournit deux zones distinctes :
 
-- **Monitoring en lecture seule** : Overview, Files, Anomalies, Agents, Quarantine et Runs lisent exclusivement les JSON immuables de `history/runs/`.
+- **Monitoring en lecture seule** : Overview, Files, Anomalies, Agents, Quarantine et Runs utilisent les JSON de `history/runs/` pour leurs agrégats. Les verdicts détaillés, rapports et sources sont lus sur demande via `artifacts.py` ; aucune de ces pages ne relance le pipeline.
 - **Action** : New Audit appelle directement `orchestrateur.executer_audit()` et déclenche le pipeline existant. Il ne modifie ni verdict, ni anomalies, ni quarantine, ni history manuellement.
 
 ## Architecture
@@ -12,6 +12,8 @@ Le dashboard Streamlit fournit deux zones distinctes :
 - `transformations.py` : DataFrames `runs_df`, `files_df`, `agents_df`, `severity_df`.
 - `components.py` : composants et présentation partagés.
 - `audit_service.py` : interface Python entre l'UI et l'orchestrateur.
+- `artifacts.py` : lectures contrôlées LOCAL/S3, téléchargement des rapports et sources, cache des artefacts.
+- `anomaly_data.py` : détails et traçabilité des anomalies issus des verdicts persistés.
 - `pages/` : pages fonctionnelles du dashboard.
 
 La navigation automatique du dossier `pages/` est désactivée dans `.streamlit/config.toml` : la sidebar de `app.py` reste l'unique navigation visible.
@@ -41,11 +43,15 @@ $env:STORAGE_MODE = 's3'
 streamlit run dashboard/app.py
 ```
 
-Pour une future instance EC2 :
+Pour un lancement direct écoutant sur le réseau (hors conteneur, à limiter par
+les règles réseau appropriées) :
 
 ```powershell
 streamlit run dashboard/app.py --server.address 0.0.0.0
 ```
+
+Le déploiement EC2 utilise Docker, ECR et Nginx : le port de l'hôte est publié
+sur `127.0.0.1:8501` par défaut. Voir [DEPLOYMENT.md](../DEPLOYMENT.md).
 
 ## New Audit
 
@@ -57,7 +63,14 @@ L'upload manuel de nouveaux fichiers n'est volontairement pas inclus dans cette 
 
 ## Cache
 
-Le history et ses DataFrames sont mis en cache avec `st.cache_data`. Le bouton **Refresh data** vide uniquement ce cache et ne relance jamais un audit. Après un audit, le cache est vidé et le résultat est relu depuis history, qui reste l'unique source de vérité du dashboard.
+Le history et ses DataFrames sont mis en cache pendant 300 secondes, la liste
+des entrées pendant 120 secondes, et les artefacts pendant
+`ARTIFACT_CACHE_TTL_SECONDS` (900 secondes par défaut). Le bouton **Refresh data**
+appelle `st.cache_data.clear()` : il invalide ces caches, sans relancer d'audit.
+Après un audit, le cache est vidé et le nouveau run est relu depuis history.
+Les détails d'anomalies restent dans les verdicts référencés ; ils ne sont pas
+dupliqués dans history. Les sources et copies en quarantaine peuvent évoluer
+indépendamment des rapports versionnés par run.
 
 ## Permissions IAM conceptuelles
 
@@ -90,4 +103,5 @@ credentials. Un `AccessDenied` n'est plus présenté comme un historique simplem
 - aucun worker, file de tâches ou mécanisme d'annulation n'est fourni ;
 - les pages affichent les compteurs d'anomalies présents dans history, sans inventer de détail absent ;
 - les rapports sont référencés par leur chemin ou clé, sans rendre S3 public ;
-- le déploiement EC2, Docker, HTTPS et CI/CD restent hors de cette étape.
+- la protection contre un second audit concerne la session Streamlit courante ; aucun verrou global multi-utilisateurs n'est fourni ;
+- EC2, Docker, ECR et Nginx sont documentés dans [DEPLOYMENT.md](../DEPLOYMENT.md) ; HTTPS et CI/CD ne sont pas configurés dans le dépôt.
