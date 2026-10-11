@@ -3,7 +3,7 @@ name: Tests, build and push to ECR
 on:
   push:
     branches:
-      - hanane
+      - main
   workflow_dispatch:
 
 permissions:
