@@ -20,6 +20,7 @@ resultats/
 cache_llm/
 
 # Logs d'exécution
+logs/
 *.log
 
 # Fichiers Excel isolés à la racine (au cas où)

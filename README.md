@@ -1,4 +1,6 @@
-# audit-qualite
+# Audit Qualité Leasing Automobile
+
+## Présentation
 
 Pipeline d'audit de qualité pour des fichiers Excel/CSV de renting
 automobile (location longue durée de véhicules). Chaque fichier passe par
@@ -8,12 +10,30 @@ un format JSON commun, agrégées ensuite en un **verdict** par fichier
 **rapports HTML**. Le mode local est utilisé pour le développement ; le mode
 S3 est disponible pour un déploiement sur AWS EC2 avec un rôle IAM.
 
+## Problématique
+
+Les fichiers de leasing automobile proviennent de sources hétérogènes : noms
+de colonnes, formats, langues et règles métier peuvent varier. Un contrôle
+manuel est difficile à reproduire, coûteux à maintenir et peu traçable. La
+plateforme automatise ces contrôles sans imposer un schéma unique aux fichiers
+d'entrée.
+
+## Objectifs
+
+- détecter les anomalies structurelles, statistiques, logiques et métier ;
+- produire un verdict explicable et des rapports exploitables ;
+- conserver les entrées, résultats, quarantaines et historiques dans S3 ;
+- fournir un dashboard Streamlit pour lancer et suivre les audits ;
+- garantir qu'un commit validé correspond exactement à l'image déployée ;
+- automatiser les tests, la publication ECR et le déploiement EC2 avec un
+  rollback sûr.
+
 Un quatrième état technique, `INCOMPLETE`, est utilisé lorsqu'une étape LLM
 obligatoire n'a pas terminé. Ce n'est pas un verdict qualité : dans ce cas le
 score, le grade et le verdict restent à `null` pour éviter un résultat
 faussement rassurant.
 
-## Vue d'ensemble du pipeline
+## Pipeline Data Quality
 
 ```
 Fichier (Excel/CSV)
@@ -37,13 +57,11 @@ Fichier (Excel/CSV)
       └── orchestrateur.py fait circuler chaque fichier à travers ces 5 étapes
 ```
 
-## Architecture AWS validée
+## Architecture générale
 
-Le déploiement de référence exécute le dashboard Streamlit et le pipeline
-complet dans un conteneur Docker sur une instance EC2 Amazon Linux 2023. Le
-conteneur `audit-qualite` écoute sur le port `8501`, utilise la policy de
-redémarrage `unless-stopped` et accède à S3 avec le rôle IAM
-`AuditQualiteEC2Role`.
+Le dashboard Streamlit et le pipeline complet s'exécutent dans le conteneur
+Docker `audit-qualite` sur EC2. Un push sur `hanane` déclenche désormais toute
+la chaîne CI/CD, jusqu'au déploiement automatique par AWS Systems Manager.
 
 ```text
 Développeur
@@ -52,22 +70,35 @@ Développeur
     v
 GitHub Actions
     |
-    +-- Python 3.12 et pytest tests/ -q
-    +-- build Docker si les tests réussissent
-    +-- credentials AWS temporaires par OIDC
+    +-- job test-build-push
+    |     +-- Python 3.12 et pytest tests/ -q
+    |     +-- build Docker si les tests réussissent
+    |     +-- OIDC puis push ECR : latest + <commit_sha>
     v
 Amazon ECR
 239280167189.dkr.ecr.eu-west-1.amazonaws.com/audit-qualite-pfa
     |
-    +-- latest
-    +-- <commit_sha>
+    | image taguée avec le SHA du commit
     |
-    | déploiement déclenché manuellement sur EC2
     v
-deployment/deploy_ec2.sh
+GitHub Actions / job deploy-ec2
+    |
+    +-- needs: test-build-push
+    +-- OIDC puis SSM SendCommand
+    v
+AWS Systems Manager / AWS-RunShellScript
+    |
+    v
+EC2 audit-qualite-pfa-ec2
+    +-- Instance ID : i-080e098227f618f29
+    +-- Private IP  : 172.31.1.146
+    +-- Elastic IP  : 52.210.165.0
+    |
+    v
+/home/ec2-user/deploy_ec2.sh
     |
     +-- authentification ECR avec AuditQualiteEC2Role
-    +-- récupération et lancement de l'image
+    +-- docker pull :<commit_sha>
     +-- health check et rollback automatique
     v
 EC2 / Docker / audit-qualite :8501
@@ -86,19 +117,29 @@ Amazon S3 privé
     +-- reports/
     +-- quarantine/
     +-- history/
+
+Utilisateur autorisé
+    |
+    | http://52.210.165.0:8501
+    v
+Security Group (port 8501 depuis My IP)
+    |
+    v
+Elastic IP 52.210.165.0 -> EC2 -> Streamlit
 ```
 
 Amazon ECR est le registre officiel des images du projet. `latest` désigne la
 dernière image publiée ; le tag `<commit_sha>` identifie une version immuable
-et constitue le choix recommandé pour un déploiement reproductible ou un
-rollback.
+et traçable. Le job `deploy-ec2` utilise le SHA, et non `latest`, afin que le
+commit Git, l'image Docker et la version exécutée sur EC2 correspondent
+exactement. Les tags SHA permettent aussi un rollback reproductible.
 
-### CI/CD
+## CI/CD
 
-La partie CI et publication d'image est automatique :
+Le workflow complet est automatique :
 
 ```text
-push hanane -> tests -> build Docker -> Amazon ECR
+push hanane -> tests -> build Docker -> Amazon ECR -> SSM -> EC2
 ```
 
 Le workflow [`.github/workflows/ecr.yml`](.github/workflows/ecr.yml) se
@@ -110,18 +151,22 @@ AWS Access Key ni AWS Secret Access Key permanentes dans GitHub. La relation de
 confiance est limitée au dépôt `SalmaAb231/audit-qualite` et à la branche
 `hanane`.
 
-Le déploiement EC2, lui, n'est pas encore déclenché automatiquement par GitHub
-Actions. Après publication de l'image, un opérateur lance sur EC2 :
+Le job `deploy-ec2`, dépendant de `test-build-push`, s'authentifie à nouveau
+par OIDC puis utilise SSM pour exécuter la copie opérationnelle du script sur
+l'instance avec `IMAGE_TAG=${GITHUB_SHA}`. Il attend la fin de la commande et
+remonte son statut, sa sortie standard et sa sortie d'erreur. Le script
+récupère l'image immuable, remplace le conteneur avec sauvegarde temporaire,
+effectue un health check local et restaure l'ancienne version en cas d'échec.
 
-```bash
-IMAGE_TAG=<commit_sha> ./deployment/deploy_ec2.sh
-```
+Le job cible l'instance par Systems Manager avec l'Instance ID
+`i-080e098227f618f29`. Il ne dépend ni de l'Elastic IP `52.210.165.0` ni de
+l'adresse IP du poste utilisateur. L'Elastic IP stabilise l'accès au
+dashboard, sans modifier le fonctionnement du CI/CD.
 
-Le script s'authentifie à ECR avec le rôle IAM de l'instance, récupère l'image,
-remplace le conteneur avec sauvegarde temporaire, effectue un health check
-local et restaure l'ancienne version en cas d'échec. L'ensemble de la chaîne a
-été validé en conditions réelles, jusqu'à l'exécution d'un audit complet, au
-verdict du Judge et à l'historique S3.
+Ainsi, le commit Git, le tag de l'image ECR et la version réellement déployée
+sont identiques. L'ensemble de cette chaîne a été validé en conditions
+réelles, jusqu'à l'exécution d'un audit complet, au verdict du Judge et à
+l'historique S3.
 
 La procédure AWS, la configuration du Security Group, les variables runtime,
 les vérifications et le rollback sont détaillés dans
@@ -165,7 +210,7 @@ C'est ce contrat commun qui permet à `judge/` d'agréger les anomalies de
 tous les détecteurs sans traitement spécifique par source, et à
 `reporting/` de les afficher de façon uniforme.
 
-## Structure détaillée du projet
+## Agents IA et composants du pipeline
 
 ### `config.py` (racine)
 
@@ -364,7 +409,7 @@ python -m ingestion.profiling
 python -m ingestion.test_s3_connexion
 ```
 
-### Stockage S3 et traçabilité
+## Stockage S3 et traçabilité
 
 En mode `STORAGE_MODE=s3`, les entrées sont lues sous `input/`. Les rapports
 et verdicts sont écrits sous `reports/runs/<run_id>/`, tandis que l'historique
@@ -376,6 +421,91 @@ public.
 Le bucket de référence documenté pour le déploiement est
 `audit-qualite-leasing-pfa-hn-2026-01-239280167189-eu-west-1-an`. Le code accepte aussi
 un autre bucket via `S3_BUCKET`.
+
+| Préfixe | Rôle |
+|---|---|
+| `input/` | fichiers Excel/CSV à auditer |
+| `reports/` | rapports HTML et verdicts générés |
+| `quarantine/` | sources rejetées ou incomplètes selon la logique applicative |
+| `history/` | historique immuable des exécutions et métriques |
+
+## Dashboard
+
+Le dashboard Streamlit est servi par le conteneur sur le port `8501`. Il
+permet de lancer un audit et de consulter les vues Overview, Files, Anomalies,
+Agents, Quarantine et Runs à partir des artefacts et historiques S3. Le bucket
+n'est jamais rendu public. Les détails fonctionnels figurent dans
+[`dashboard/README.md`](dashboard/README.md).
+
+### Accès au dashboard
+
+Adresse validée :
+
+```text
+http://52.210.165.0:8501
+```
+
+`52.210.165.0` est l'Elastic IP fixe associée à l'instance EC2 ; Streamlit
+écoute sur le port `8501`. Le Security Group limite actuellement ce port à
+`My IP`, donc le dashboard n'est pas accessible depuis n'importe quel réseau.
+HTTPS n'est pas configuré et le navigateur peut afficher « Non sécurisé ».
+
+## Docker
+
+L'image Python 3.12 embarque l'application et démarre Streamlit sur
+`0.0.0.0:8501`. GitHub Actions construit l'image après les tests et la publie
+dans ECR avec les tags `latest` et `<commit_sha>`. Sur EC2, le conteneur
+`audit-qualite` utilise `--restart unless-stopped` et le fichier runtime
+`~/audit-qualite.env`.
+
+## Infrastructure AWS
+
+L'infrastructure validée se trouve dans le compte `239280167189`, région
+`eu-west-1` :
+
+- EC2 `audit-qualite-pfa-ec2`, instance `i-080e098227f618f29`, Amazon Linux
+  2023 x86_64, type `t3.micro`, volume gp3 de 8 GiB ;
+- Elastic IP fixe `52.210.165.0`, associée à l'adresse privée EC2
+  `172.31.1.146` ;
+- repository ECR privé `audit-qualite-pfa` ;
+- bucket S3 privé indiqué ci-dessus ;
+- AWS Systems Manager pour commander le déploiement sans connexion SSH depuis
+  GitHub.
+
+Deux rôles IAM ont des responsabilités séparées :
+
+- `GitHubActionsECRRole`, assumé temporairement par GitHub OIDC, publie dans
+  ECR et pilote la commande SSM ;
+- `AuditQualiteEC2Role`, attaché à EC2, fournit l'accès S3, la lecture ECR et
+  `AmazonSSMManagedInstanceCore`.
+
+Aucune AWS Access Key statique n'est nécessaire dans GitHub ou sur EC2.
+
+## Rollback et résilience
+
+Le script conserve le conteneur précédent sous `audit-qualite-old`. Si le
+nouveau conteneur ne démarre pas, quitte ou échoue au health check local sur
+`http://127.0.0.1:8501`, il affiche ses logs et restaure automatiquement
+l'ancienne version avec la policy `unless-stopped`. Un tag SHA ECR antérieur
+permet également un redéploiement précis et reproductible.
+
+## Sécurité
+
+- authentification AWS temporaire par OIDC et séparation des rôles IAM ;
+- aucun secret AWS permanent, aucune clé `.pem` et aucune connexion SSH depuis
+  GitHub Actions ;
+- déploiement distant exclusivement par SSM ;
+- `.env` et `audit-qualite.env` non versionnés, `.env.example` sans secret ;
+- ECR et S3 privés ;
+- ports `22` et `8501` limités à `My IP` dans le Security Group.
+
+L'Elastic IP `52.210.165.0` est l'adresse publique fixe du **serveur**.
+`My IP` est l'adresse publique du **client** autorisé par le Security Group.
+Un changement de Wi-Fi, de réseau ou de fournisseur peut donc imposer
+d'actualiser `My IP`, même si l'adresse du serveur reste fixe. Cette évolution
+de l'IP cliente n'affecte pas le CD GitHub → SSM.
+
+## Tests et validation
 
 ### `docs/`
 
@@ -413,6 +543,14 @@ Cohérence redirigés vers `tmp_path`.
 python -m pytest -q
 ```
 
+### Validation de l'architecture
+
+La chaîne complète a été validée en conditions réelles : tests et build dans
+GitHub Actions, OIDC, push ECR avec les deux tags, SSM Run Command, déploiement
+du tag SHA, health check, jobs `test-build-push` et `deploy-ec2` en `Success`,
+dashboard accessible, audit réel réussi, quatre agents en `SUCCESS`, pipeline
+en `COMPLETE`, Judge fonctionnel et historique S3 disponible.
+
 ### Dossiers non versionnés (exclus par `.gitignore`)
 
 - **`data/`** : fichiers Excel/CSV réels à auditer, organisés par mois
@@ -428,7 +566,7 @@ python -m pytest -q
   Le fingerprint est formé des 12 premiers caractères hexadécimaux du SHA-256
   de la clé ; la clé elle-même n'est ni stockée ni journalisée.
 
-## Installation pour un nouveau membre
+## Exécution locale
 
 1. Cloner le dépôt et se placer sur son propre travail (branche personnelle,
    ex. `git checkout -b <prenom>`).
@@ -502,3 +640,16 @@ python -m pytest -q
 | Reporting | ✅ Implémenté (HTML), testé |
 | Orchestrateur | ✅ Implémenté, testé — pipeline complet de bout en bout |
 | Dépôt S3 des rapports (`config.S3_REPORTS_PREFIX`) | ✅ Implémenté en mode S3, sous `reports/runs/<run_id>/` |
+
+## Déploiement
+
+Après réussite de `test-build-push`, le job `deploy-ec2` déclenche
+automatiquement le déploiement du tag `${GITHUB_SHA}` sur EC2 avec Systems
+Manager. La procédure technique, le rollback, le Security Group, les
+variables runtime et le dépannage sont détaillés dans
+[`DEPLOYMENT.md`](DEPLOYMENT.md).
+
+Limitation actuelle : le workflow déploie automatiquement les images, mais ne
+synchronise pas le fichier `deployment/deploy_ec2.sh`. Sa copie opérationnelle
+`/home/ec2-user/deploy_ec2.sh` doit être mise à jour séparément si le script
+versionné change.
