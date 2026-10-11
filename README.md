@@ -37,6 +37,96 @@ Fichier (Excel/CSV)
       └── orchestrateur.py fait circuler chaque fichier à travers ces 5 étapes
 ```
 
+## Architecture AWS validée
+
+Le déploiement de référence exécute le dashboard Streamlit et le pipeline
+complet dans un conteneur Docker sur une instance EC2 Amazon Linux 2023. Le
+conteneur `audit-qualite` écoute sur le port `8501`, utilise la policy de
+redémarrage `unless-stopped` et accède à S3 avec le rôle IAM
+`AuditQualiteEC2Role`.
+
+```text
+Développeur
+    |
+    | push sur hanane
+    v
+GitHub Actions
+    |
+    +-- Python 3.12 et pytest tests/ -q
+    +-- build Docker si les tests réussissent
+    +-- credentials AWS temporaires par OIDC
+    v
+Amazon ECR
+239280167189.dkr.ecr.eu-west-1.amazonaws.com/audit-qualite-pfa
+    |
+    +-- latest
+    +-- <commit_sha>
+    |
+    | déploiement déclenché manuellement sur EC2
+    v
+deployment/deploy_ec2.sh
+    |
+    +-- authentification ECR avec AuditQualiteEC2Role
+    +-- récupération et lancement de l'image
+    +-- health check et rollback automatique
+    v
+EC2 / Docker / audit-qualite :8501
+    |
+    +-- Dashboard Streamlit
+    +-- Structure Agent
+    +-- Statistics Agent
+    +-- Coherence Agent ------> OpenRouter
+    +-- Realism Agent --------> OpenRouter
+    +-- Judge
+    +-- Reporting
+    |
+    v
+Amazon S3 privé
+    +-- input/
+    +-- reports/
+    +-- quarantine/
+    +-- history/
+```
+
+Amazon ECR est le registre officiel des images du projet. `latest` désigne la
+dernière image publiée ; le tag `<commit_sha>` identifie une version immuable
+et constitue le choix recommandé pour un déploiement reproductible ou un
+rollback.
+
+### CI/CD
+
+La partie CI et publication d'image est automatique :
+
+```text
+push hanane -> tests -> build Docker -> Amazon ECR
+```
+
+Le workflow [`.github/workflows/ecr.yml`](.github/workflows/ecr.yml) se
+déclenche sur un push vers `hanane` ou avec `workflow_dispatch`. Ses
+permissions sont limitées à `contents: read` et `id-token: write`. Il assume
+temporairement le rôle
+`arn:aws:iam::239280167189:role/GitHubActionsECRRole` avec GitHub OIDC, sans
+AWS Access Key ni AWS Secret Access Key permanentes dans GitHub. La relation de
+confiance est limitée au dépôt `SalmaAb231/audit-qualite` et à la branche
+`hanane`.
+
+Le déploiement EC2, lui, n'est pas encore déclenché automatiquement par GitHub
+Actions. Après publication de l'image, un opérateur lance sur EC2 :
+
+```bash
+IMAGE_TAG=<commit_sha> ./deployment/deploy_ec2.sh
+```
+
+Le script s'authentifie à ECR avec le rôle IAM de l'instance, récupère l'image,
+remplace le conteneur avec sauvegarde temporaire, effectue un health check
+local et restaure l'ancienne version en cas d'échec. L'ensemble de la chaîne a
+été validé en conditions réelles, jusqu'à l'exécution d'un audit complet, au
+verdict du Judge et à l'historique S3.
+
+La procédure AWS, la configuration du Security Group, les variables runtime,
+les vérifications et le rollback sont détaillés dans
+[`DEPLOYMENT.md`](DEPLOYMENT.md).
+
 ## Choix de conception : schema-agnostic
 
 Les fichiers source ont des structures de colonnes différentes, et chaque

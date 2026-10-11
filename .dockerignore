@@ -3,6 +3,7 @@
 !.env.example
 *.pem
 audit-qualite.env
+*.tar
 
 .git
 .gitignore

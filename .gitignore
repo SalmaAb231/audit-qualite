@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+*.pem
+audit-qualite.env
+*.tar
 
 # Données (peuvent être volumineuses et confidentielles)
 data/
